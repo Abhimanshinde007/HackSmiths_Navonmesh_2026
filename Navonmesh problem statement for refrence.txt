@@ -1,0 +1,20 @@
+26008 - Inventory Optimization
+Inefficient Inventory Planning and Stock Imbalance Across Supply Chains Retailers, warehouses, manufacturers, and small-to-medium enterprises frequently face challenges in maintaining optimal inventory levels. Overstocking leads to increased holding costs, spoilage, and capital lock-in, while understocking results in lost sales, customer dissatisfaction, and supply disruptions.
+Retailers, warehouses, manufacturers, and small-to-medium enterprises frequently face challenges in maintaining optimal inventory levels. Overstocking leads to increased holding costs, spoilage, and capital lock-in, while understocking results in lost sales, customer dissatisfaction, and supply disruptions.
+
+In many cases, inventory decisions are based on static forecasting models, manual estimation, or historical averages that fail to adapt to:
+
+* Seasonal demand variability
+
+* Sudden demand spikes or supply disruptions
+
+* Regional consumption patterns
+
+* Perishable inventory constraints
+
+* Multi-warehouse distribution complexities
+
+Additionally, fragmented data systems and lack of predictive visibility prevent organizations from responding dynamically to changing market conditions.
+
+Challenge Statement Design a scalable and intelligent inventory optimization framework that dynamically balances supply and demand, minimizes stockouts and overstocking, and improves overall supply chain efficiency under real-world uncertainty.
+Design a scalable and intelligent inventory optimization framework that dynamically balances supply and demand, minimizes stockouts and overstocking, and improves overall supply chain efficiency under real-world uncertainty.
