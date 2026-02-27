@@ -1,197 +1,237 @@
 """
 Predictive Inventory & Procurement Intelligence Platform
-Hackathon MVP — PDR v2
+Full MVP with Tally PDF Support — Streamlit Frontend
 """
 
 import streamlit as st
 import pandas as pd
 
 from utils.data_processor import (
-    load_sales_excel,
-    get_anchor_customers,
-    predict_reorder,
-    process_bom,
-    forecast_raw_materials,
+    ingest_sales_excel, ingest_sales_pdf,
+    get_anchor_customers, predict_reorder,
+    ingest_inout_excel, ingest_inout_pdf, compute_stock,
+    ingest_purchase_excel, ingest_purchase_pdf, compute_purchase_summary,
+    material_outlook,
 )
 
-# ── Page Config ──────────────────────────────────────────────────────────────
+# ── Page Config ───────────────────────────────────────────────
 st.set_page_config(
-    page_title="Procurement Intelligence | MSME",
+    page_title="MSME Procurement Intelligence",
     page_icon="🏭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-def _load_css():
-    try:
-        with open("style.css") as f:
-            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-    except FileNotFoundError:
-        pass
+# ── CSS ───────────────────────────────────────────────────────
+try:
+    with open("style.css") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+except FileNotFoundError:
+    pass
 
-_load_css()
+# ── Session State ─────────────────────────────────────────────
+_keys = ["sales_df", "inout_df", "purchase_df",
+         "anchor_df", "predictions_df", "stock_df",
+         "purchase_summary", "outlook_df", "processed"]
+for k in _keys:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
-# ── Session State ─────────────────────────────────────────────────────────────
-for key in ["sales_df", "bom_df", "anchor_df", "predictions_df", "forecast_df", "processed"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🏭 Data Ingestion")
+    st.markdown("## 🏭 MSME Data Ingestion")
     st.markdown("---")
+    st.caption("Accepted formats: **.xlsx / .xls / .pdf** (text-based Tally exports)")
 
-    st.markdown("### 📂 Sales Register")
-    sales_file = st.file_uploader("Upload Sales Excel (.xlsx)", type=["xlsx", "xls"], key="sales_upload")
+    st.markdown("### 📊 Sales Register")
+    sales_file = st.file_uploader("Upload Sales Register", type=["xlsx", "xls", "pdf"], key="sales_up")
 
-    st.markdown("### 📂 Bill of Materials")
-    bom_file = st.file_uploader("Upload BOM Excel (.xlsx)", type=["xlsx", "xls"], key="bom_upload")
+    st.markdown("### 📦 Inward / Outward Register")
+    inout_file = st.file_uploader("Upload Inward / Outward Register", type=["xlsx", "xls", "pdf"], key="inout_up")
+
+    st.markdown("### 🛒 Purchase Register")
+    purchase_file = st.file_uploader("Upload Purchase Register", type=["xlsx", "xls", "pdf"], key="purch_up")
 
     st.markdown("---")
     run_btn = st.button("▶ Process & Run Insights", use_container_width=True)
 
     if run_btn:
-        if not sales_file:
-            st.error("Please upload a Sales Register first.")
-        else:
-            with st.spinner("Processing data..."):
-                # --- Load Sales ---
-                df, err = load_sales_excel(sales_file)
-                if err:
-                    st.error(f"Sales ingestion failed: {err}")
-                    st.session_state.sales_df = None
-                else:
-                    st.session_state.sales_df = df
-                    st.success(f"Sales loaded: {len(df):,} clean rows")
+        with st.spinner("Processing all registers..."):
 
-                # --- Load BOM ---
-                if bom_file:
-                    bom_df, berr = process_bom(bom_file)
-                    if berr:
-                        st.warning(f"BOM issue: {berr}")
-                        st.session_state.bom_df = None
+            # ── Sales ──────────────────────────────────────────
+            if sales_file:
+                try:
+                    is_pdf = sales_file.name.lower().endswith(".pdf")
+                    if is_pdf:
+                        df, err = ingest_sales_pdf(sales_file.read())
                     else:
-                        st.session_state.bom_df = bom_df
-                        st.success(f"BOM loaded: {len(bom_df)} entries")
+                        df, err = ingest_sales_excel(sales_file)
+                    if err:
+                        st.error(f"Sales: {err}")
+                        st.session_state.sales_df = None
+                    else:
+                        st.session_state.sales_df = df
+                        anchor, aerr = get_anchor_customers(df)
+                        st.session_state.anchor_df = anchor
+                        if aerr:
+                            st.warning(f"Anchor customers: {aerr}")
+                        pred, perr = predict_reorder(df, anchor)
+                        st.session_state.predictions_df = pred
+                        st.success(f"Sales loaded: {len(df):,} rows | {df['customer'].nunique()} customers")
+                except Exception as e:
+                    st.error(f"Sales processing error: {e}")
 
-                # --- Run Analytics ---
-                if st.session_state.sales_df is not None:
-                    anchor_df, aerr = get_anchor_customers(st.session_state.sales_df)
-                    st.session_state.anchor_df = anchor_df
+            # ── Inward / Outward ────────────────────────────────
+            if inout_file:
+                try:
+                    is_pdf = inout_file.name.lower().endswith(".pdf")
+                    if is_pdf:
+                        df_io, err = ingest_inout_pdf(inout_file.read())
+                    else:
+                        df_io, err = ingest_inout_excel(inout_file)
+                    if err:
+                        st.error(f"Inward/Outward: {err}")
+                        st.session_state.inout_df = None
+                    else:
+                        st.session_state.inout_df = df_io
+                        stock, serr = compute_stock(df_io)
+                        st.session_state.stock_df = stock
+                        st.success(f"Stock register loaded: {df_io['material'].nunique()} materials")
+                except Exception as e:
+                    st.error(f"Inward/Outward processing error: {e}")
 
-                    pred_df, perr = predict_reorder(st.session_state.sales_df, anchor_df)
-                    st.session_state.predictions_df = pred_df
+            # ── Purchase ────────────────────────────────────────
+            if purchase_file:
+                try:
+                    is_pdf = purchase_file.name.lower().endswith(".pdf")
+                    if is_pdf:
+                        df_p, err = ingest_purchase_pdf(purchase_file.read())
+                    else:
+                        df_p, err = ingest_purchase_excel(purchase_file)
+                    if err:
+                        st.error(f"Purchase: {err}")
+                        st.session_state.purchase_df = None
+                    else:
+                        st.session_state.purchase_df = df_p
+                        summary, _ = compute_purchase_summary(df_p)
+                        st.session_state.purchase_summary = summary
+                        st.success(f"Purchase register loaded: {len(df_p):,} rows")
+                except Exception as e:
+                    st.error(f"Purchase processing error: {e}")
 
-                    if st.session_state.bom_df is not None and not anchor_df.empty:
-                        fc_df, fcerr = forecast_raw_materials(
-                            st.session_state.sales_df,
-                            anchor_df,
-                            pred_df,
-                            st.session_state.bom_df
-                        )
-                        st.session_state.forecast_df = fc_df
+            # ── Material Outlook ────────────────────────────────
+            if st.session_state.stock_df is not None and not st.session_state.stock_df.empty:
+                outlook, oerr = material_outlook(
+                    st.session_state.stock_df,
+                    st.session_state.predictions_df,
+                    st.session_state.sales_df
+                )
+                st.session_state.outlook_df = outlook
 
-                    st.session_state.processed = True
+            if sales_file or inout_file or purchase_file:
+                st.session_state.processed = True
 
-# ── Main Dashboard ────────────────────────────────────────────────────────────
+# ── Main Dashboard ────────────────────────────────────────────
 st.markdown("# 🏭 Predictive Inventory & Procurement Dashboard")
-st.markdown("*Turning unstructured MSME Excel data into procurement intelligence.*")
+st.markdown("*MSME-grade procurement intelligence — no ERP required.*")
 st.markdown("---")
 
 if not st.session_state.processed:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info("**Step 1**\nUpload your Sales Register Excel from the sidebar. Any format accepted.")
-    with col2:
-        st.info("**Step 2**\n(Optional) Upload your Bill of Materials to enable raw material forecasting.")
-    with col3:
-        st.info("**Step 3**\nClick **Process & Run Insights** to generate demand predictions.")
+    st.info("Upload at least one register from the sidebar and click **Process & Run Insights** to begin.")
     st.stop()
 
-# ─── Section 1: Cleaned Data Preview ─────────────────────────────────────────
-st.markdown("## 1. Cleaned Data Preview")
-if st.session_state.sales_df is not None and not st.session_state.sales_df.empty:
-    df = st.session_state.sales_df
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Rows Loaded", f"{len(df):,}")
-    c2.metric("Unique Customers", f"{df['customer'].nunique():,}")
-    c3.metric("Date Range", f"{df['date'].min().strftime('%d %b %Y')} → {df['date'].max().strftime('%d %b %Y')}")
-    st.dataframe(df.head(20), use_container_width=True)
-else:
-    st.warning("No clean sales data available. Check that your file has Date, Customer and Quantity columns.")
+# ── Three-column dashboard ────────────────────────────────────
+col_sales, col_stock, col_outlook = st.columns(3)
 
-st.markdown("---")
+# ─── Column 1: Sales Insights ─────────────────────────────────
+with col_sales:
+    st.markdown("### 📊 Sales Insights")
 
-# ─── Section 2: Anchor Customers ─────────────────────────────────────────────
-st.markdown("## 2. Anchor Customers")
-if st.session_state.anchor_df is not None and not st.session_state.anchor_df.empty:
-    anchor = st.session_state.anchor_df.copy()
-    anchor.columns = ['Customer', 'Total Quantity', 'Order Count', 'Contribution %']
-    st.markdown("*Top revenue-driving customers ranked by total quantity ordered.*")
-    st.dataframe(anchor.style.format({'Total Quantity': '{:,.0f}', 'Contribution %': '{:.1f}%'}), use_container_width=True)
+    if st.session_state.sales_df is not None and not st.session_state.sales_df.empty:
+        df = st.session_state.sales_df
+        st.metric("Total Clean Rows", f"{len(df):,}")
+        st.metric("Unique Customers", f"{df['customer'].nunique():,}")
+        dr = f"{df['date'].min().strftime('%d %b %y')} → {df['date'].max().strftime('%d %b %y')}"
+        st.caption(f"Date range: {dr}")
 
-    # Bar chart
-    try:
-        st.bar_chart(anchor.set_index('Customer')['Total Quantity'])
-    except Exception:
-        pass
-else:
-    st.info("Anchor customers will appear here after processing sales data.")
+        if st.session_state.anchor_df is not None and not st.session_state.anchor_df.empty:
+            st.markdown("**Anchor Customers**")
+            anchor = st.session_state.anchor_df.copy()
+            anchor.columns = ['Customer', 'Total Qty', 'Orders', 'Share %']
+            st.dataframe(anchor.style.format({'Total Qty': '{:,.0f}', 'Share %': '{:.1f}%'}),
+                        use_container_width=True, height=220)
 
-st.markdown("---")
+        if st.session_state.predictions_df is not None and not st.session_state.predictions_df.empty:
+            st.markdown("**Reorder Predictions**")
+            pred = st.session_state.predictions_df
 
-# ─── Section 3: Reorder Prediction Panel ─────────────────────────────────────
-st.markdown("## 3. Reorder Prediction Panel")
-if st.session_state.predictions_df is not None and not st.session_state.predictions_df.empty:
-    pred = st.session_state.predictions_df
+            def _conf_colour(val):
+                if val >= 70: return 'color: green; font-weight:bold'
+                elif val >= 40: return 'color: orange'
+                return 'color: red'
 
-    st.markdown("*Customers with fewer than 3 historical orders are excluded from predictions.*")
-
-    # Colour confidence score
-    def colour_confidence(val):
-        if val >= 70:
-            return 'color: green; font-weight: bold'
-        elif val >= 40:
-            return 'color: orange; font-weight: bold'
+            try:
+                styled = pred.style.applymap(_conf_colour, subset=['Confidence %'])
+                st.dataframe(styled, use_container_width=True, height=250)
+            except Exception:
+                st.dataframe(pred, use_container_width=True, height=250)
         else:
-            return 'color: red; font-weight: bold'
-
-    try:
-        styled = pred.style.applymap(colour_confidence, subset=['Confidence %'])
-        st.dataframe(styled, use_container_width=True)
-    except Exception:
-        st.dataframe(pred, use_container_width=True)
-
-    # Summary metrics
-    if len(pred) > 0:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Customers Predicted", len(pred))
-        c2.metric("Avg Reorder Interval", f"{pred['Avg Interval (Days)'].mean():.0f} days")
-        c3.metric("Avg Confidence", f"{pred['Confidence %'].mean():.1f}%")
-else:
-    st.info("Predictions require anchor customers with at least 3 historical orders. Check your date column is parsed correctly.")
-
-st.markdown("---")
-
-# ─── Section 4: BOM + Raw Material Forecast ──────────────────────────────────
-st.markdown("## 4. Raw Material Forecast")
-
-if st.session_state.bom_df is not None and not st.session_state.bom_df.empty:
-    with st.expander("View BOM Mapping", expanded=False):
-        st.dataframe(st.session_state.bom_df, use_container_width=True)
-
-    if st.session_state.forecast_df is not None and not st.session_state.forecast_df.empty:
-        fc = st.session_state.forecast_df
-
-        st.markdown("*Projected raw material requirement based on anchor customer predicted order quantities × BOM.*")
-        st.dataframe(fc, use_container_width=True)
-
-        try:
-            st.bar_chart(fc.set_index('Raw Material')['Projected Requirement'])
-        except Exception:
-            pass
+            st.info("Predictions require ≥ 3 orders per customer.")
     else:
-        st.info("Raw material forecast will appear once both Sales data and BOM are loaded.")
-else:
-    st.info("Upload a BOM file from the sidebar to enable raw material forecasting.")
+        st.info("Upload a Sales Register to see insights.")
+
+# ─── Column 2: Stock Status ───────────────────────────────────
+with col_stock:
+    st.markdown("### 📦 Stock Status")
+
+    if st.session_state.stock_df is not None and not st.session_state.stock_df.empty:
+        stock = st.session_state.stock_df.copy()
+        low_stock = stock[stock['current_stock'] <= 0]
+        st.metric("Total Materials", len(stock))
+        st.metric("Low / Zero Stock", len(low_stock), delta_color="inverse")
+
+        def _highlight_low(row):
+            colour = 'background-color: #ffe0e0' if row['current_stock'] <= 0 else ''
+            return [colour] * len(row)
+
+        st.dataframe(
+            stock.style.apply(_highlight_low, axis=1)
+                       .format({'total_inward': '{:,.0f}', 'total_outward': '{:,.0f}', 'current_stock': '{:,.0f}'}),
+            use_container_width=True, height=400
+        )
+    else:
+        st.info("Upload an Inward/Outward Register to see stock status.")
+
+    if st.session_state.purchase_summary is not None and not st.session_state.purchase_summary.empty:
+        st.markdown("**Purchase Summary**")
+        st.dataframe(st.session_state.purchase_summary, use_container_width=True, height=200)
+
+# ─── Column 3: Material Outlook ────────────────────────────────
+with col_outlook:
+    st.markdown("### 🔮 Material Outlook")
+
+    if st.session_state.outlook_df is not None and not st.session_state.outlook_df.empty:
+        outlook = st.session_state.outlook_df
+
+        procure_count = outlook[outlook['Advisory'].str.contains('Prepare', na=False)].shape[0] if 'Advisory' in outlook.columns else 0
+        monitor_count = outlook[outlook['Advisory'].str.contains('Monitor', na=False)].shape[0] if 'Advisory' in outlook.columns else 0
+
+        c1, c2 = st.columns(2)
+        c1.metric("🔴 Procure Soon", procure_count)
+        c2.metric("🟡 Monitor", monitor_count)
+
+        def _highlight_advisory(row):
+            if 'Advisory' in row.index and 'Prepare' in str(row['Advisory']):
+                return ['background-color: #fff3cd'] * len(row)
+            elif 'Advisory' in row.index and 'Out' in str(row['Advisory']):
+                return ['background-color: #ffe0e0'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(
+            outlook.style.apply(_highlight_advisory, axis=1),
+            use_container_width=True, height=420
+        )
+    elif st.session_state.stock_df is not None:
+        st.info("Upload Sales Register + Inward/Outward to generate Material Outlook.")
+    else:
+        st.info("Upload registers to generate procurement advisory.")
