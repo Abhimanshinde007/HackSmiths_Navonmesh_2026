@@ -250,51 +250,51 @@ def _regex_parse(text):
     """Best-effort regex parser for when no Gemini key is set. Handles merged files by chunking."""
     lines = text.splitlines()
 
-    # Find headers to identify distinct invoices
-    HEADER_KW = ['description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate']
-    hdr_indices = []
-    for i, line in enumerate(lines):
-        if sum(1 for kw in HEADER_KW if kw in line.lower()) >= 3:
-            hdr_indices.append(i)
+    # Strategy: Split on "Buyer / Bill to" markers — each invoice starts with this section.
+    # This is far more reliable than splitting on table headers in merged visual Excel files.
+    INVOICE_START_RE = re.compile(
+        r'(buyer\s*(?:\(bill\s*to\))?|bill\s*to)', re.IGNORECASE
+    )
 
-    if not hdr_indices:
+    split_indices = [i for i, l in enumerate(lines) if INVOICE_START_RE.search(l)]
+
+    if not split_indices:
+        # Fallback: split on "GST INVOICE" heading
+        split_indices = [i for i, l in enumerate(lines) if 'gst invoice' in l.lower() or 'tax invoice' in l.lower()]
+
+    if len(split_indices) <= 1:
+        # Final fallback: split on table headers as before
+        HEADER_KW = ['description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate']
+        split_indices = [i for i, l in enumerate(lines)
+                         if sum(1 for kw in HEADER_KW if kw in l.lower()) >= 3]
+
+    if not split_indices:
         return [], "No product rows found. Set GEMINI_API_KEY in .streamlit/secrets.toml for AI-powered parsing."
 
-    # Identify chunks (one per invoice)
-    chunk_boundaries = [0]
-    for i in range(len(hdr_indices) - 1):
-        curr_hdr = hdr_indices[i]
-        next_hdr = hdr_indices[i+1]
-        
-        split_idx = (curr_hdr + next_hdr) // 2 
-        for j in range(curr_hdr + 1, next_hdr):
-            low = lines[j].lower()
-            if "invoice" in low and ("gst" in low or "tax" in low):
-                split_idx = j
-                break
-            if "buyer" in low and "bill to" in low:
-                split_idx = max(curr_hdr + 1, j - 2)
-                break
-            if "amount chargeable" in low or "declaration" in low:
-                split_idx = j + 2
-                break
-        chunk_boundaries.append(split_idx)
-    chunk_boundaries.append(len(lines))
+    # Suppress duplicate nearby hits (within 5 lines of each other)
+    deduped = [split_indices[0]]
+    for idx in split_indices[1:]:
+        if idx - deduped[-1] > 5:
+            deduped.append(idx)
+    split_indices = deduped
+
+    # Build chunks between each split point
+    chunk_starts = [max(0, idx - 2) for idx in split_indices]   # include 2 lines above for seller info
+    chunk_ends   = chunk_starts[1:] + [len(lines)]
 
     all_items = []
-    for i in range(len(hdr_indices)):
-        start_idx = chunk_boundaries[i]
-        end_idx = chunk_boundaries[i+1]
-        chunk_lines = lines[start_idx:end_idx]
-        chunk_text = "\n".join(chunk_lines)
-        
-        items, err = _parse_single_invoice_regex(chunk_text, chunk_lines)
+    for start, end in zip(chunk_starts, chunk_ends):
+        chunk_lines = lines[start:end]
+        chunk_text  = "\n".join(chunk_lines)
+        items, _ = _parse_single_invoice_regex(chunk_text, chunk_lines)
         if items:
             all_items.extend(items)
-            
+
     if not all_items:
         return [], "No product rows found. Set GEMINI_API_KEY for AI parsing."
     return all_items, None
+
+
 
 
 def _parse_single_invoice_regex(text, lines):
