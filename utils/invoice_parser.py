@@ -247,8 +247,58 @@ def parse_gst_invoice_pdf(file_bytes, api_key=None):
 # ─────────────────────────────────────────────────────────────
 
 def _regex_parse(text):
-    """Best-effort regex parser for when no Gemini key is set."""
+    """Best-effort regex parser for when no Gemini key is set. Handles merged files by chunking."""
     lines = text.splitlines()
+
+    # Find headers to identify distinct invoices
+    HEADER_KW = ['description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate']
+    hdr_indices = []
+    for i, line in enumerate(lines):
+        if sum(1 for kw in HEADER_KW if kw in line.lower()) >= 3:
+            hdr_indices.append(i)
+
+    if not hdr_indices:
+        return [], "No product rows found. Set GEMINI_API_KEY in .streamlit/secrets.toml for AI-powered parsing."
+
+    # Identify chunks (one per invoice)
+    chunk_boundaries = [0]
+    for i in range(len(hdr_indices) - 1):
+        curr_hdr = hdr_indices[i]
+        next_hdr = hdr_indices[i+1]
+        
+        split_idx = (curr_hdr + next_hdr) // 2 
+        for j in range(curr_hdr + 1, next_hdr):
+            low = lines[j].lower()
+            if "invoice" in low and ("gst" in low or "tax" in low):
+                split_idx = j
+                break
+            if "buyer" in low and "bill to" in low:
+                split_idx = max(curr_hdr + 1, j - 2)
+                break
+            if "amount chargeable" in low or "declaration" in low:
+                split_idx = j + 2
+                break
+        chunk_boundaries.append(split_idx)
+    chunk_boundaries.append(len(lines))
+
+    all_items = []
+    for i in range(len(hdr_indices)):
+        start_idx = chunk_boundaries[i]
+        end_idx = chunk_boundaries[i+1]
+        chunk_lines = lines[start_idx:end_idx]
+        chunk_text = "\n".join(chunk_lines)
+        
+        items, err = _parse_single_invoice_regex(chunk_text, chunk_lines)
+        if items:
+            all_items.extend(items)
+            
+    if not all_items:
+        return [], "No product rows found. Set GEMINI_API_KEY for AI parsing."
+    return all_items, None
+
+
+def _parse_single_invoice_regex(text, lines):
+    """Parses a single invoice string chunk."""
 
     # Date
     m = re.search(r'\b(\d{1,2}[-](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-]\d{2,4})\b', text, re.IGNORECASE)
