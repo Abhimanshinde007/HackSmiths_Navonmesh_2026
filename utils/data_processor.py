@@ -90,73 +90,115 @@ def _remove_total_rows(df):
 # PDF EXTRACTION HELPER
 # ─────────────────────────────────────────────────────────────
 
-def _extract_pdf_text(file_bytes):
-    """Extract all text from a text-based PDF using pdfplumber. Returns (text, error)."""
+def _ingest_pdf_to_dataframe(file_bytes, keywords):
+    """
+    Robust PDF → DataFrame extractor.
+    Strategy 1: pdfplumber extract_tables() — works great on Tally PDF table exports.
+    Strategy 2: text line parsing — fallback for plaintext-style PDFs.
+    Returns (df, error).
+    """
     if not PDF_AVAILABLE:
         return None, "pdfplumber not installed. Run: pip install pdfplumber"
     try:
-        text_pages = []
+        all_tables = []
+        all_text_lines = []
+
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            if len(pdf.pages) == 0:
+                return None, "Scanned PDFs not supported. Please upload Excel or text-based Tally export."
+
             for page in pdf.pages:
+                # Strategy 1: extract structured tables
+                tables = page.extract_tables()
+                for table in tables:
+                    if table and len(table) > 1:
+                        all_tables.append(table)
+
+                # Also collect raw text as fallback
                 t = page.extract_text()
                 if t:
-                    text_pages.append(t)
-        combined = "\n".join(text_pages).strip()
-        if len(combined) < 50:
+                    all_text_lines.extend(t.splitlines())
+
+        # ── Strategy 1: Use structured table data ──────────────────
+        if all_tables:
+            # Merge all table fragments
+            combined_rows = []
+            header = None
+            for table in all_tables:
+                # Clean nulls
+                table = [[str(c).strip() if c else '' for c in row] for row in table]
+                table = [row for row in table if any(c for c in row)]
+
+                if not table:
+                    continue
+
+                # Detect if first row is a header (contains keywords)
+                first_row_str = ' '.join(table[0]).lower()
+                row_score = sum(1 for kw in keywords if kw in first_row_str)
+
+                if row_score >= 1 and header is None:
+                    header = table[0]
+                    combined_rows.extend(table[1:])
+                elif header is None:
+                    # No header yet — try next row
+                    continue
+                else:
+                    # Already have header, just add data rows
+                    combined_rows.extend(table)
+
+            if header and combined_rows:
+                # Trim rows to header length
+                n = len(header)
+                trimmed = [r[:n] + [''] * max(0, n - len(r)) for r in combined_rows]
+                df = pd.DataFrame(trimmed, columns=header)
+                df = df.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
+                if len(df) > 0:
+                    return df, None
+
+        # ── Strategy 2: Text line fallback ─────────────────────────
+        lines = [l.strip() for l in all_text_lines if l.strip()]
+        if len(lines) < 5:
             return None, "Scanned PDFs not supported. Please upload Excel or text-based Tally export."
-        return combined, None
+
+        # Find best header line
+        best_idx, best_score = 0, 0
+        for i, line in enumerate(lines[:30]):
+            score = sum(1 for kw in keywords if kw in line.lower())
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_score < 2:
+            return None, "Unable to parse PDF structure. Please upload Tally Excel export."
+
+        # Split into columns by 2+ consecutive spaces (Tally alignment)
+        header_line = lines[best_idx]
+        cols = [c.strip() for c in re.split(r'\s{2,}', header_line) if c.strip()]
+        if len(cols) < 2:
+            # Single-space fallback
+            cols = header_line.split()
+
+        data_rows = []
+        for line in lines[best_idx + 1:]:
+            parts = [c.strip() for c in re.split(r'\s{2,}', line) if c.strip()]
+            if not parts:
+                continue
+            # Pad or trim to column count
+            while len(parts) < len(cols):
+                parts.append('')
+            data_rows.append(parts[:len(cols)])
+
+        if not data_rows:
+            return None, "No data rows found in PDF."
+
+        df = pd.DataFrame(data_rows, columns=cols)
+        df = df.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
+        return df, None
+
     except Exception as e:
-        return None, str(e)
+        return None, f"PDF read error: {str(e)}"
 
 
-def _pdf_text_to_dataframe(text, row_keywords):
-    """
-    Try to convert raw Tally export text into a dataframe.
-    Strategy: find header line, parse subsequent lines by whitespace alignment.
-    """
-    lines = [l for l in text.splitlines() if l.strip()]
-
-    # Find the header line
-    header_idx = -1
-    best_score = 0
-    for i, line in enumerate(lines):
-        score = sum(1 for kw in row_keywords if kw in line.lower())
-        if score > best_score:
-            best_score = score
-            header_idx = i
-
-    if header_idx == -1 or best_score < 2:
-        return None, "Unable to parse PDF structure. Please upload Tally Excel export."
-
-    header_line = lines[header_idx]
-    # Detect column positions by looking at where words start in the header
-    col_positions, col_names = [], []
-    for m in re.finditer(r'\S+', header_line):
-        col_positions.append(m.start())
-        col_names.append(m.group().strip())
-
-    if len(col_names) < 2:
-        return None, "Unable to parse PDF structure. Please upload Tally Excel export."
-
-    rows = []
-    for line in lines[header_idx + 1:]:
-        if not line.strip():
-            continue
-        # Slice each column by position
-        row = []
-        for j, pos in enumerate(col_positions):
-            end = col_positions[j + 1] if j + 1 < len(col_positions) else len(line)
-            cell = line[pos:end].strip() if pos < len(line) else ""
-            row.append(cell)
-        rows.append(row)
-
-    if not rows:
-        return None, "No data rows found in PDF."
-
-    df = pd.DataFrame(rows, columns=col_names)
-    # Drop completely empty rows
-    df = df.replace("", pd.NA).dropna(how='all').reset_index(drop=True)
-    return df, None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -239,17 +281,18 @@ def ingest_sales_excel(file):
 
 def ingest_sales_pdf(file_bytes):
     """Load a Sales Register from a text-based Tally PDF. Returns (df, error, qty_label)."""
-    text, err = _extract_pdf_text(file_bytes)
-    if err:
-        return None, err, None
-    df_raw, err = _pdf_text_to_dataframe(text, SALES_KEYWORDS)
-    if err:
-        return None, err, None
-    orig_cols = [_normalize_col(c) for c in df_raw.columns]
-    df_raw.columns = orig_cols
-    df_raw = _rename_by_map(df_raw, SALES_COL_MAP)
-    df_raw = _deduplicate_columns(df_raw)
-    return _clean_sales_df(df_raw, orig_cols)
+    try:
+        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, SALES_KEYWORDS)
+        if err:
+            return None, err, None
+        orig_cols = [_normalize_col(c) for c in df_raw.columns]
+        df_raw.columns = orig_cols
+        df_raw = _rename_by_map(df_raw, SALES_COL_MAP)
+        df_raw = _deduplicate_columns(df_raw)
+        return _clean_sales_df(df_raw, orig_cols)
+    except Exception as e:
+        return None, str(e), None
+
 
 
 
@@ -351,16 +394,17 @@ def ingest_inout_excel(file):
 
 def ingest_inout_pdf(file_bytes):
     """Load Inward/Outward register from PDF."""
-    text, err = _extract_pdf_text(file_bytes)
-    if err:
-        return None, err
-    df_raw, err = _pdf_text_to_dataframe(text, INOUT_KEYWORDS)
-    if err:
-        return None, err
-    df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
-    df_raw = _rename_by_map(df_raw, INOUT_COL_MAP)
-    df_raw = _deduplicate_columns(df_raw)
-    return _clean_inout_df(df_raw)
+    try:
+        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, INOUT_KEYWORDS)
+        if err:
+            return None, err
+        df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
+        df_raw = _rename_by_map(df_raw, INOUT_COL_MAP)
+        df_raw = _deduplicate_columns(df_raw)
+        return _clean_inout_df(df_raw)
+    except Exception as e:
+        return None, str(e)
+
 
 
 def compute_stock(inout_df):
@@ -429,16 +473,17 @@ def ingest_purchase_excel(file):
 
 def ingest_purchase_pdf(file_bytes):
     """Load Purchase register from PDF."""
-    text, err = _extract_pdf_text(file_bytes)
-    if err:
-        return None, err
-    df_raw, err = _pdf_text_to_dataframe(text, PURCHASE_KEYWORDS)
-    if err:
-        return None, err
-    df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
-    df_raw = _rename_by_map(df_raw, PURCHASE_COL_MAP)
-    df_raw = _deduplicate_columns(df_raw)
-    return _clean_purchase_df(df_raw)
+    try:
+        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, PURCHASE_KEYWORDS)
+        if err:
+            return None, err
+        df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
+        df_raw = _rename_by_map(df_raw, PURCHASE_COL_MAP)
+        df_raw = _deduplicate_columns(df_raw)
+        return _clean_purchase_df(df_raw)
+    except Exception as e:
+        return None, str(e)
+
 
 
 def compute_purchase_summary(purchase_df):
