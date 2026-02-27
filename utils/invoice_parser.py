@@ -1,7 +1,7 @@
 """
-GST Invoice PDF Parser
-Parses individual Tally-generated GST Invoice PDFs into structured rows.
-Each PDF = one invoice. Returns a combined Sales Register DataFrame.
+GST Invoice PDF Parser — Full Text Scan Approach
+Reads all raw text from each Tally GST Invoice PDF page by page,
+then extracts fields by scanning patterns across the whole text.
 """
 
 import io
@@ -15,213 +15,272 @@ except ImportError:
     PDF_AVAILABLE = False
 
 
-def _extract_pdf_tables_and_text(file_bytes):
-    """Extract all tables and full text from a PDF page."""
-    tables, text_lines = [], []
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _read_pdf_text(file_bytes):
+    """Extract all text from a PDF. Returns (full_text, lines_list, error)."""
+    if not PDF_AVAILABLE:
+        return None, [], "pdfplumber not installed."
     try:
+        lines_all = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                return None, [], "Empty PDF."
             for page in pdf.pages:
-                tbls = page.extract_tables()
-                if tbls:
-                    tables.extend(tbls)
-                t = page.extract_text()
+                t = page.extract_text(x_tolerance=3, y_tolerance=3)
                 if t:
-                    text_lines.extend(t.splitlines())
-    except Exception:
-        pass
-    return tables, text_lines
+                    lines_all.extend(t.splitlines())
+        if not lines_all:
+            return None, [], "Scanned PDF – no extractable text. Use text-based Tally export."
+        full_text = '\n'.join(lines_all)
+        return full_text, lines_all, None
+    except Exception as e:
+        return None, [], f"PDF read error: {str(e)}"
 
 
-def _clean_cell(val):
-    """Normalize a table cell value."""
-    if val is None:
-        return ''
-    return str(val).strip().replace('\n', ' ')
+def _strip(s):
+    return str(s).strip() if s else ''
 
 
-def _find_in_text(lines, *labels):
-    """Search text lines for a value that appears after a given label."""
-    text = '\n'.join(lines)
-    for label in labels:
-        # Try pattern: label followed by colon and value on same or next line
-        pattern = re.compile(re.escape(label) + r'\s*[:\-]?\s*(.+)', re.IGNORECASE)
-        m = pattern.search(text)
-        if m:
-            val = m.group(1).strip().split('\n')[0].strip()
-            if val:
-                return val
+# ─────────────────────────────────────────────────────────────
+# EXTRACTION FUNCTIONS  (scan the full text)
+# ─────────────────────────────────────────────────────────────
+
+def _extract_date(full_text):
+    """Find invoice date — try dd-Mon-yy first, then dd/mm/yyyy."""
+    # dd-Mon-yy or dd-Mon-yyyy  (e.g. 8-Jan-26, 15-Mar-2025)
+    m = re.search(
+        r'\b(\d{1,2}[-](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-]\d{2,4})\b',
+        full_text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1)
+    # dd/mm/yyyy
+    m = re.search(r'\b(\d{1,2}[/]\d{1,2}[/]\d{4})\b', full_text)
+    if m:
+        return m.group(1)
     return None
 
 
+def _extract_invoice_no(full_text):
+    """Find Tally invoice number like AE/25-26/1316."""
+    # 3-segment: PREFIX/YYYY-YY/NUM
+    m = re.search(r'\b([A-Z]{1,6}[/\-]\d{2,4}[/\-]\d{2,4}[/\-]\d{1,6})\b', full_text)
+    if m:
+        return m.group(1)
+    # 2-segment: PREFIX/NUM
+    m = re.search(r'\b([A-Z]{1,6}[/\-]\d{1,6})\b', full_text)
+    if m:
+        return m.group(1)
+    return 'UNKNOWN'
+
+
+def _extract_customer(lines):
+    """
+    Scan lines top-to-bottom.
+    Find 'Buyer' / 'Bill to' label, then return the NEXT non-empty,
+    non-metadata line as the customer name.
+    """
+    SKIP_KEYWORDS = [
+        'gstin', 'state', 'contact', 'sr.', 'no.', 'code', 'e-mail',
+        'email', 'phone', 'mob', 'dispatched', 'destination',
+        'delivery', 'term', 'reference', 'udyam', 'iso', 'certified',
+        'invoice', 'dated', 'voucher', 'bill no', 'mode', 'payment',
+        'buyer', 'bill to', 'ship to',
+    ]
+
+    buyer_section = False
+    for i, line in enumerate(lines):
+        l = line.strip()
+        ll = l.lower()
+
+        if re.search(r'buyer\s*[\(\[]?\s*bill\s+to', ll) or ll.startswith('buyer') or 'bill to' in ll:
+            buyer_section = True
+            continue
+
+        if buyer_section:
+            if not l:
+                continue
+            if any(kw in ll for kw in SKIP_KEYWORDS):
+                continue
+            if len(l) < 5:
+                continue
+            # Strip trailing date patterns like "8-Jan-26" or dates that got merged on same line
+            l = re.sub(r'\s+\d{1,2}[-/]\w{3,9}[-/]\d{2,4}\s*$', '', l).strip()
+            l = re.sub(r'\s+\d{1,2}[/-]\d{1,2}[/-]\d{4}\s*$', '', l).strip()
+            if l and len(l) > 5:
+                return l
+
+
+    # Fallback: look for lines with company indicators
+    for line in lines:
+        l = line.strip()
+        if (re.search(r'\b(PVT|LTD|LLC|INC|CORP|CO\.|PRIVATE|LIMITED|INDUSTRIES|ENTERPRISES|TRADING|SOLUTIONS|SYSTEMS|PERIPHERALS)\b', l, re.IGNORECASE)
+                and len(l) > 8):
+            return l
+    return None
+
+
+def _extract_items_from_text(lines):
+    """
+    Scan all lines looking for the items table header
+    ('Description of Goods', 'Sl', 'HSN', 'Qty', 'Amount' etc.)
+    then parse subsequent lines as product rows.
+    """
+    ITEMS_HEADER_KEYWORDS = ['description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate']
+    SKIP_PRODUCT_KEYWORDS = ['sgst', 'cgst', 'igst', 'total', 'tax', 'cess', 'amount in words',
+                              'declaration', 'bank', 'authoris', 'subject', 'computer', 'e. & o.e']
+
+    # Find items header line
+    header_idx = None
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        hits = sum(1 for kw in ITEMS_HEADER_KEYWORDS if kw in ll)
+        if hits >= 3:  # Must match at least 3 column keywords
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return []
+
+    items = []
+    # Scan lines after the header
+    i = header_idx + 1
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+
+        if not line:
+            continue
+
+        ll = line.lower()
+
+        # Stop if we hit the totals/footer section
+        if any(kw in ll for kw in SKIP_PRODUCT_KEYWORDS):
+            continue
+
+        # A product line starts with a serial number or has a numeric amount at the end
+        # Pattern: optional-sl-no  product-description  optional-HSN  qty  rate  amount
+        # Try to detect lines that have a monetary amount at the end: digits with comma, e.g. 9,300.00
+        has_amount = bool(re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}\s*$', line))
+        starts_with_num = bool(re.match(r'^\d+\s+\S', line))
+
+        if has_amount or starts_with_num:
+            # Extract numbers from line
+            numbers = re.findall(r'[\d,]+\.?\d*', line)
+            clean_nums = []
+            for n in numbers:
+                try:
+                    clean_nums.append(float(n.replace(',', '')))
+                except ValueError:
+                    pass
+
+            # Remove serial number if line starts with it
+            desc_line = re.sub(r'^\d+\s+', '', line)
+
+            # Extract description (text before HSN and numbers)
+            # Description is the longest text segment at the start
+            desc_match = re.match(r'^([A-Za-z0-9\s\-\/\.\(\)]+?)(?:\s+\d{4,}\s|\s+\d+\s+(?:NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT))', desc_line, re.IGNORECASE)
+            if desc_match:
+                description = desc_match.group(1).strip()
+            else:
+                # Take all text before the first 4+ digit number (likely HSN code)
+                description = re.sub(r'\s+\d{4,}.*$', '', desc_line).strip()
+
+            if not description or len(description) < 3:
+                continue
+            if any(kw in description.lower() for kw in SKIP_PRODUCT_KEYWORDS):
+                continue
+
+            # Quantity: look for "N NOS." or "N PCS" pattern
+            qty = None
+            qty_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT|Nos|Pcs)\.?', line, re.IGNORECASE)
+            if qty_match:
+                try:
+                    qty = float(qty_match.group(1))
+                except ValueError:
+                    pass
+            elif clean_nums:
+                # Use the number that's likely qty (usually smallest, non-amount)
+                for n in clean_nums:
+                    if n < 10000 and n == int(n):
+                        qty = n
+                        break
+
+            # Unit
+            unit_match = re.search(r'\b(NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\b\.?', line, re.IGNORECASE)
+            unit = unit_match.group(1).upper() if unit_match else ''
+
+            # Amount: last number in line is typically the amount
+            amount = clean_nums[-1] if clean_nums else None
+
+            if description and (qty is not None or amount is not None):
+                items.append({
+                    'description': description,
+                    'quantity': qty,
+                    'unit': unit,
+                    'amount': amount,
+                })
+
+        # Check if next line is a continuation of description (no numbers = sub-description or spec)
+        # Skip it silently — the description is already captured
+
+    return items
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN PARSER
+# ─────────────────────────────────────────────────────────────
+
 def parse_gst_invoice_pdf(file_bytes):
     """
-    Parse a single Tally GST Invoice PDF.
+    Parse a single Tally GST Invoice PDF by full-text scan.
     Returns (list_of_row_dicts, error_string).
-    Each row has: date, invoice_no, customer, product, quantity, unit, amount.
+    Each row: date, invoice_no, customer, product, quantity, unit, amount
     """
-    if not PDF_AVAILABLE:
-        return [], "pdfplumber not installed."
+    full_text, lines, err = _read_pdf_text(file_bytes)
+    if err:
+        return [], err
 
-    try:
-        tables, text_lines = _extract_pdf_tables_and_text(file_bytes)
-        text = '\n'.join(text_lines)
+    date_val   = _extract_date(full_text)
+    invoice_no = _extract_invoice_no(full_text)
+    customer   = _extract_customer(lines)
+    items      = _extract_items_from_text(lines)
 
-        if not text.strip():
-            return [], "Scanned PDF - no text extractable. Use text-based Tally export."
+    if not items:
+        return [], (
+            f"Could not extract product rows. "
+            f"Date={date_val}, Customer={customer}, "
+            f"Lines scanned={len(lines)}"
+        )
 
-        # ── Extract invoice-level fields ────────────────────────────
-        # Strategy: first try raw text regex (most reliable for merged cells)
-        # then fall back to label search
+    rows = []
+    for item in items:
+        rows.append({
+            'date':       date_val,
+            'invoice_no': invoice_no,
+            'customer':   customer or 'UNKNOWN',
+            'product':    item['description'],
+            'quantity':   item['quantity'],
+            'unit':       item['unit'],
+            'amount':     item['amount'],
+        })
 
-        # Date — look for date patterns in raw text
-        date_val = None
-        # Priority 1: dd-Mon-yy or dd-Mon-yyyy pattern (e.g. 8-Jan-26)
-        m = re.search(r'\b(\d{1,2}[-](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\-\/]\d{2,4})\b', text, re.IGNORECASE)
-        if m:
-            date_val = m.group(1)
-        else:
-            # dd/mm/yyyy or dd-mm-yyyy
-            m = re.search(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})\b', text)
-            date_val = m.group(1) if m else None
-
-        # Invoice number — look for Tally pattern like AE/25-26/1316 or INV/001
-        invoice_no = 'UNKNOWN'
-        # Try 3-part pattern first: AE/25-26/1316
-        m = re.search(r'\b([A-Z]{1,6}[/\-]\d{2,4}[/\-]\d{2,4}[/\-]\d{1,6})\b', text)
-        if not m:
-            # 2-part: AE/1316 or INV/001
-            m = re.search(r'\b([A-Z]{1,6}[/\-]\d{1,6})\b', text)
-        if m:
-            invoice_no = m.group(1)
+    return rows, None
 
 
-        # Customer name — "Buyer (Bill to)" section
-        customer = None
-        # Look for text after "Buyer (Bill to)" or "Bill To"
-        for label in ['Buyer (Bill to)', 'Bill to', 'Buyer', 'Customer', 'Party Name']:
-            m = re.search(re.escape(label) + r'[)]*\s*\n+\s*([A-Z][A-Z0-9\s\.\&\,\-]+)', text, re.IGNORECASE)
-            if m:
-                candidate = m.group(1).strip().split('\n')[0].strip()
-                # Must be reasonably long and look like a company name
-                if len(candidate) > 5 and not any(kw in candidate.lower() for kw in ['certif', 'iso', 'state', 'gstin', 'contact']):
-                    customer = candidate
-                    break
-
-        # Fallback: find ALL-CAPS lines that look like company names after skipping the seller header
-        if not customer:
-            seller_done = False
-            for line in text_lines:
-                line_clean = line.strip()
-                if not seller_done:
-                    if 'buyer' in line_clean.lower() or 'bill to' in line_clean.lower():
-                        seller_done = True
-                    continue
-                if (re.match(r'^[A-Z][A-Z\s\.\&\,\-]{5,}$', line_clean) and
-                        not any(kw in line_clean.lower() for kw in ['gstin', 'state', 'contact', 'sr.', 'no.'])):
-                    customer = line_clean
-                    break
-
-        # ── Extract product rows from the items table ───────────────
-        # Find the items table — it has columns: Sl No, Description, HSN, Qty, Rate, per, Amount
-        items_rows = []
-
-        for table in tables:
-            if not table or len(table) < 2:
-                continue
-            # Clean table
-            clean_table = [[_clean_cell(c) for c in row] for row in table]
-            clean_table = [r for r in clean_table if any(c for c in r)]
-
-            # Find header row with "description" and "quantity"/"qty"
-            hdr_idx = None
-            for i, row in enumerate(clean_table):
-                row_str = ' '.join(row).lower()
-                if ('description' in row_str or 'goods' in row_str) and \
-                   ('qty' in row_str or 'quantity' in row_str or 'amount' in row_str):
-                    hdr_idx = i
-                    break
-
-            if hdr_idx is None:
-                continue
-
-            header = clean_table[hdr_idx]
-
-            # Map header positions
-            col_idx = {}
-            for ci, h in enumerate(header):
-                hl = h.lower()
-                if 'description' in hl or 'goods' in hl:
-                    col_idx['product'] = ci
-                elif 'qty' in hl or 'quantity' in hl:
-                    col_idx['quantity'] = ci
-                elif 'per' == hl.strip():
-                    col_idx['unit'] = ci
-                elif 'amount' in hl:
-                    col_idx['amount'] = ci
-                elif 'rate' in hl:
-                    col_idx['rate'] = ci
-                elif 'hsn' in hl or 'sac' in hl:
-                    col_idx['hsn'] = ci
-
-            if 'product' not in col_idx:
-                continue
-
-            # Parse data rows
-            for row in clean_table[hdr_idx + 1:]:
-                product = row[col_idx['product']] if col_idx.get('product') is not None and col_idx['product'] < len(row) else ''
-                # Skip totals, SGST, CGST rows
-                if not product or any(kw in product.lower() for kw in
-                                       ['total', 'sgst', 'cgst', 'igst', 'tax', 'amount in words', 'grand']):
-                    continue
-                # Skip rows where product looks like a sub-note (italic spec line)
-                if product.startswith('SEC-') or product.startswith('sec-'):
-                    continue
-
-                qty_raw = row[col_idx['quantity']] if col_idx.get('quantity') is not None and col_idx['quantity'] < len(row) else ''
-                qty_str = re.sub(r'[^\d.]', '', qty_raw)  # strip "NOS." etc.
-                qty = float(qty_str) if qty_str else None
-
-                unit_raw = ''
-                if col_idx.get('unit') is not None and col_idx['unit'] < len(row):
-                    unit_raw = row[col_idx['unit']]
-
-                # Fallback unit from qty string (e.g. "30 NOS.")
-                if not unit_raw:
-                    m = re.search(r'[A-Za-z]+', qty_raw)
-                    unit_raw = m.group(0) if m else ''
-
-                amt_raw = row[col_idx['amount']] if col_idx.get('amount') is not None and col_idx['amount'] < len(row) else ''
-                amt_str = re.sub(r'[^\d.]', '', amt_raw)
-                amount = float(amt_str) if amt_str else None
-
-                if product and (qty or amount):
-                    items_rows.append({
-                        'date': date_val,
-                        'invoice_no': invoice_no,
-                        'customer': customer or 'UNKNOWN',
-                        'product': product,
-                        'quantity': qty,
-                        'unit': unit_raw,
-                        'amount': amount,
-                    })
-
-        if not items_rows:
-            return [], f"Could not extract product rows. Date={date_val}, Customer={customer}, Tables found={len(tables)}"
-
-        return items_rows, None
-
-    except Exception as e:
-        return [], f"Invoice parse error: {str(e)}"
-
+# ─────────────────────────────────────────────────────────────
+# MULTI-INVOICE INGESTION
+# ─────────────────────────────────────────────────────────────
 
 def ingest_multiple_invoices(file_list):
     """
     Parse a list of (filename, bytes) tuples as individual GST invoices.
     Returns (combined_df, list_of_errors).
-    combined_df columns: date, invoice_no, customer, product, quantity, unit, amount
     """
-    all_rows = []
-    errors = []
+    all_rows, errors = [], []
 
     for fname, fbytes in file_list:
         rows, err = parse_gst_invoice_pdf(fbytes)
@@ -234,8 +293,8 @@ def ingest_multiple_invoices(file_list):
         return pd.DataFrame(), errors
 
     df = pd.DataFrame(all_rows)
-    df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+    df['date']     = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
     df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce')
-    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+    df['amount']   = pd.to_numeric(df['amount'],   errors='coerce')
     df = df.dropna(subset=['customer']).reset_index(drop=True)
     return df, errors
