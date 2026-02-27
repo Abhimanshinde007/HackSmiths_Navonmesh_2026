@@ -107,22 +107,24 @@ def _gemini_parse_all(text, api_key):
     last_err = "No models succeeded"
     for model_name in GEMINI_MODELS:
         try:
+            # We enforce JSON output at the API level
             response = client.models.generate_content(
                 model=model_name,
                 contents=GEMINI_PROMPT + text,
                 config=genai_types.GenerateContentConfig(
                     temperature=0,
-                    max_output_tokens=4096, 
+                    max_output_tokens=8192, 
+                    response_mime_type="application/json",
                 )
             )
             raw = response.text.strip()
-            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-            raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
             
+            # Since we forced application/json, it should be pure json
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 parsed = [parsed]
             return parsed, None
+
         except Exception as e:
             err_str = str(e)
             if '429' in err_str or 'quota' in err_str.lower():
