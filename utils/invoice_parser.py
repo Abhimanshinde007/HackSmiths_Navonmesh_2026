@@ -90,39 +90,60 @@ Text to parse:
 """
 
 
+# Models available on this advanced API key
+GEMINI_MODELS = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash'
+]
+
 def _gemini_parse_all(text, api_key):
-    """Parse entire text via Gemini 1.5 Flash in ONE call. Returns (list_of_dicts, error)."""
+    """Parse entire text via Gemini in ONE call. Returns (list_of_dicts, error)."""
     try:
         client = genai.Client(api_key=api_key)
-        # We use gemini-1.5-flash: 1M token context, officially supported, generous free tier.
-        response = client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=GEMINI_PROMPT + text,
-            config=genai_types.GenerateContentConfig(
-                temperature=0,
-                # Output can be larger since it's an array of invoices
-                max_output_tokens=4096, 
-            )
-        )
-        raw = response.text.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-        
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            # Sometimes it returns a single object if there's only 1 invoice
-            parsed = [parsed]
-        return parsed, None
-        
-    except json.JSONDecodeError as e:
-        return None, f"JSON error: {e}"
     except Exception as e:
-        return None, f"Gemini API error: {str(e)}"
+        return None, f"Failed to init Gemini client: {e}"
+        
+    last_err = "No models succeeded"
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=GEMINI_PROMPT + text,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    max_output_tokens=4096, 
+                )
+            )
+            raw = response.text.strip()
+            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+            raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
+            
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            return parsed, None
+        except Exception as e:
+            err_str = str(e)
+            if '429' in err_str or 'quota' in err_str.lower():
+                last_err = f"{model_name}: Quota exceeded"
+                continue
+            if '404' in err_str or 'not found' in err_str.lower():
+                last_err = f"{model_name}: Model not found"
+                continue
+            # If it's a JSON parse error, we return it rather than trying another model
+            if isinstance(e, json.JSONDecodeError):
+                return None, f"JSON error from {model_name}: {e}"
+            last_err = f"API error ({model_name}): {err_str}"
+            
+    return None, last_err
+
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN PARSER
 # ─────────────────────────────────────────────────────────────
+
 
 SKIP_PRODUCT_KEYWORDS = [
     'sgst', 'cgst', 'igst', 'output cgst', 'output sgst',
