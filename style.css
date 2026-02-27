@@ -11,6 +11,14 @@
     background-color: #FFFFFF;
 }
 
+/* Force text colors for normal paragraphs due to Streamlit dark mode */
+p,
+span,
+div,
+label {
+    color: #333333 !important;
+}
+
 /* Sidebar background */
 [data-testid="stSidebar"] {
     background-color: #eef1f6;
@@ -18,7 +26,11 @@
 }
 
 /* Typography styles */
-h1, h2, h3, h4, hr {
+h1,
+h2,
+h3,
+h4,
+hr {
     color: #0B3D91 !important;
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
 }
@@ -34,7 +46,8 @@ h1, h2, h3, h4, hr {
 }
 
 .stButton>button:hover {
-    background-color: #F4B400; /* Amber hover effect */
+    background-color: #F4B400;
+    /* Amber hover effect */
     color: #0B3D91;
 }
 

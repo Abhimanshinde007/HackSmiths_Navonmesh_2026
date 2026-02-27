@@ -240,7 +240,7 @@ def process_stock_movement(df):
     for col in df.columns:
         if any(kw in col for kw in ['item', 'product', 'sku', 'goods']):
             col_mapping[col] = 'sku'
-        elif any(kw in col for kw in ['in', 'receipt', 'purchase', 'received']):
+        elif any(kw in col for kw in ['in', 'receipt', 'purchase', 'received', 'qty', 'quantity', 'amount']):
             col_mapping[col] = 'stock_in'
         elif any(kw in col for kw in ['out', 'issue', 'sales', 'consumed']):
             col_mapping[col] = 'stock_out'
@@ -250,25 +250,29 @@ def process_stock_movement(df):
     df = df.rename(columns=col_mapping)
     
     # Velocity calculation if columns exist
-    if 'sku' in df.columns and 'stock_out' in df.columns:
-        velocity = df.groupby('sku')['stock_out'].sum().reset_index()
-        velocity = velocity.sort_values(by='stock_out', ascending=False)
+    if 'sku' in df.columns:
+        # Determine tracking column (prefer outgoing sales, fallback to incoming purchases for velocity mapping)
+        target_col = 'stock_out' if 'stock_out' in df.columns else 'stock_in' if 'stock_in' in df.columns else None
         
-        # Categorize
-        quantiles = velocity['stock_out'].quantile([0.33, 0.66])
-        def categorize(val):
-            if pd.isna(val) or val <= quantiles[0.33]: return 'Slow Mover'
-            elif val <= quantiles[0.66]: return 'Steady'
-            else: return 'Fast Mover'
+        if target_col:
+            velocity = df.groupby('sku')[target_col].sum().reset_index()
+            velocity = velocity.sort_values(by=target_col, ascending=False)
             
-        velocity['category'] = velocity['stock_out'].apply(categorize)
-        
-        # Merge back if current stock is present
-        if 'current_stock' in df.columns:
-            curr_stock = df.groupby('sku')['current_stock'].last().reset_index()
-            velocity = pd.merge(velocity, curr_stock, on='sku', how='left')
+            # Categorize
+            quantiles = velocity[target_col].quantile([0.33, 0.66])
+            def categorize(val):
+                if pd.isna(val) or val <= quantiles[0.33]: return 'Low Volume'
+                elif val <= quantiles[0.66]: return 'Steady Volume'
+                else: return 'High Volume'
+                
+            velocity['category'] = velocity[target_col].apply(categorize)
             
-        return velocity
+            # Merge back if current stock is present
+            if 'current_stock' in df.columns:
+                curr_stock = df.groupby('sku')['current_stock'].last().reset_index()
+                velocity = pd.merge(velocity, curr_stock, on='sku', how='left')
+                
+            return velocity
         
     return df
 
