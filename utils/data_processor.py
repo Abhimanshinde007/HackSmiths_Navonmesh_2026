@@ -134,39 +134,56 @@ def _ingest_pdf_to_dataframe(file_bytes, keywords):
 
         # ── Strategy 1: Use structured table data ──────────────────
         if all_tables:
-            # Merge all table fragments
             combined_rows = []
             header = None
+
+            def _is_letterhead_row(row):
+                """True if this row looks like a merged letterhead/address cell."""
+                for cell in row:
+                    if '\n' in cell:           # multiline = merged address block
+                        return True
+                    if len(cell) > 80:          # very long single cell = not a table header
+                        return True
+                non_empty = [c for c in row if c.strip()]
+                if len(non_empty) < 2:          # only 1 cell filled = likely address
+                    return True
+                return False
+
             for table in all_tables:
                 # Clean nulls
-                table = [[str(c).strip() if c else '' for c in row] for row in table]
+                table = [[str(c).strip().replace('\n', ' ') if c else '' for c in row] for row in table]
                 table = [row for row in table if any(c for c in row)]
 
                 if not table:
                     continue
 
-                # Detect if first row is a header (contains keywords)
-                first_row_str = ' '.join(table[0]).lower()
-                row_score = sum(1 for kw in keywords if kw in first_row_str)
-
-                if row_score >= 1 and header is None:
-                    header = table[0]
-                    combined_rows.extend(table[1:])
-                elif header is None:
-                    # No header yet — try next row
-                    continue
+                if header is None:
+                    # Scan every row in this table to find the real header
+                    for ri, row in enumerate(table):
+                        if _is_letterhead_row(row):
+                            continue  # skip address/letterhead blocks
+                        row_str = ' '.join(row).lower()
+                        row_score = sum(1 for kw in keywords if kw in row_str)
+                        non_empty_cells = len([c for c in row if c.strip()])
+                        # Accept if keywords match OR if it has 4+ clean cells (column-like)
+                        if row_score >= 1 or non_empty_cells >= 4:
+                            header = row
+                            combined_rows.extend(table[ri + 1:])
+                            break
                 else:
-                    # Already have header, just add data rows
-                    combined_rows.extend(table)
+                    # Already have header — just append data rows, skip letterhead rows
+                    for row in table:
+                        if not _is_letterhead_row(row):
+                            combined_rows.append(row)
 
             if header and combined_rows:
-                # Trim rows to header length
                 n = len(header)
                 trimmed = [r[:n] + [''] * max(0, n - len(r)) for r in combined_rows]
                 df = pd.DataFrame(trimmed, columns=header)
                 df = df.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
                 if len(df) > 0:
                     return df, None
+
 
         # ── Strategy 2: Text line fallback ─────────────────────────
         lines = [l.strip() for l in all_text_lines if l.strip()]
