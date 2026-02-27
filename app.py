@@ -32,7 +32,8 @@ except FileNotFoundError:
 # ── Session State ─────────────────────────────────────────────
 _keys = ["sales_df", "inout_df", "purchase_df",
          "anchor_df", "predictions_df", "stock_df",
-         "purchase_summary", "outlook_df", "processed"]
+         "purchase_summary", "outlook_df", "processed",
+         "sales_qty_label"]
 for k in _keys:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -63,14 +64,15 @@ with st.sidebar:
                 try:
                     is_pdf = sales_file.name.lower().endswith(".pdf")
                     if is_pdf:
-                        df, err = ingest_sales_pdf(sales_file.read())
+                        df, err, qty_label = ingest_sales_pdf(sales_file.read())
                     else:
-                        df, err = ingest_sales_excel(sales_file)
+                        df, err, qty_label = ingest_sales_excel(sales_file)
                     if err:
                         st.error(f"Sales: {err}")
                         st.session_state.sales_df = None
                     else:
                         st.session_state.sales_df = df
+                        st.session_state.sales_qty_label = qty_label or 'Value'
                         anchor, aerr = get_anchor_customers(df)
                         st.session_state.anchor_df = anchor
                         if aerr:
@@ -155,10 +157,12 @@ with col_sales:
         st.caption(f"Date range: {dr}")
 
         if st.session_state.anchor_df is not None and not st.session_state.anchor_df.empty:
+            qty_col_label = st.session_state.get('sales_qty_label', 'Value')
             st.markdown("**Anchor Customers**")
+            st.caption(f"📌 Ranked by: **{qty_col_label}**")
             anchor = st.session_state.anchor_df.copy()
-            anchor.columns = ['Customer', 'Total Qty', 'Orders', 'Share %']
-            st.dataframe(anchor.style.format({'Total Qty': '{:,.0f}', 'Share %': '{:.1f}%'}),
+            anchor.columns = ['Customer', qty_col_label, 'Orders', 'Share %']
+            st.dataframe(anchor.style.format({qty_col_label: '{:,.0f}', 'Share %': '{:.1f}%'}),
                         use_container_width=True, height=220)
 
         if st.session_state.predictions_df is not None and not st.session_state.predictions_df.empty:

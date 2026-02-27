@@ -177,22 +177,34 @@ SALES_COL_MAP = {
 }
 
 
-def _clean_sales_df(df):
-    """Shared sales cleaning logic after column mapping."""
+FINANCIAL_QTY_COLS = {'gross_total', 'grosstotal', 'value', 'net_amount', 'net_total',
+                      'amount', 'invoice_value', 'taxable_value'}
+
+
+def _clean_sales_df(df, original_cols_before_rename):
+    """Shared sales cleaning logic. Returns (df, error, qty_label)."""
     df = _remove_total_rows(df)
 
     required = ['date', 'customer']
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, f"Could not find required columns: {missing}. Detected: {list(df.columns)}"
+        return None, f"Could not find required columns: {missing}. Detected: {list(df.columns)}", None
 
-    # Fallback: if quantity missing, pick first remaining numeric-looking column
+    # Detect whether quantity is physical units or financial value
+    qty_label = 'Quantity'
+    financial_used = any(c in FINANCIAL_QTY_COLS for c in original_cols_before_rename)
+    if financial_used and 'quantity' not in [c for c in original_cols_before_rename
+                                              if c not in FINANCIAL_QTY_COLS]:
+        qty_label = 'Invoice Value (₹)'
+
+    # Fallback: if quantity still missing, pick first remaining column
     if 'quantity' not in df.columns:
         candidates = [c for c in df.columns if c not in ('date', 'customer', 'product')]
         if candidates:
             df = df.rename(columns={candidates[0]: 'quantity'})
+            qty_label = 'Invoice Value (₹)'
         else:
-            return None, "No numeric column found for order value."
+            return None, "No numeric column found for order value.", None
 
     keep = [c for c in ['date', 'customer', 'product', 'quantity'] if c in df.columns]
     df = df[keep]
@@ -204,36 +216,41 @@ def _clean_sales_df(df):
     df = df[df['quantity'] > 0]
     df['customer'] = df['customer'].astype(str).str.strip()
     df = df[df['customer'].str.len() > 1]
-    return df.reset_index(drop=True), None
+    return df.reset_index(drop=True), None, qty_label
+
 
 
 def ingest_sales_excel(file):
-    """Load a Sales Register from Excel. Returns (df, error)."""
+    """Load a Sales Register from Excel. Returns (df, error, qty_label)."""
     try:
         raw = pd.read_excel(file, header=None, dtype=str)
         raw = raw.dropna(how='all').reset_index(drop=True)
         hdr = _detect_header_row(raw, SALES_KEYWORDS, min_hits=3)
         df = pd.read_excel(file, header=hdr, dtype=str)
-        df.columns = [_normalize_col(c) for c in df.columns]
+        orig_cols = [_normalize_col(c) for c in df.columns]
+        df.columns = orig_cols
         df = _rename_by_map(df, SALES_COL_MAP)
         df = _deduplicate_columns(df)
-        return _clean_sales_df(df)
+        return _clean_sales_df(df, orig_cols)
     except Exception as e:
-        return None, str(e)
+        return None, str(e), None
+
 
 
 def ingest_sales_pdf(file_bytes):
-    """Load a Sales Register from a text-based Tally PDF. Returns (df, error)."""
+    """Load a Sales Register from a text-based Tally PDF. Returns (df, error, qty_label)."""
     text, err = _extract_pdf_text(file_bytes)
     if err:
-        return None, err
+        return None, err, None
     df_raw, err = _pdf_text_to_dataframe(text, SALES_KEYWORDS)
     if err:
-        return None, err
-    df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
+        return None, err, None
+    orig_cols = [_normalize_col(c) for c in df_raw.columns]
+    df_raw.columns = orig_cols
     df_raw = _rename_by_map(df_raw, SALES_COL_MAP)
     df_raw = _deduplicate_columns(df_raw)
-    return _clean_sales_df(df_raw)
+    return _clean_sales_df(df_raw, orig_cols)
+
 
 
 # ─────────────────────────────────────────────────────────────
