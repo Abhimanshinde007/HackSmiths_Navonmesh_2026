@@ -3,4 +3,5 @@ pandas
 numpy
 openpyxl
 pdfplumber
+google-generativeai
 xlrd

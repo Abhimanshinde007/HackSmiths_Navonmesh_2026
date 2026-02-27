@@ -16,6 +16,12 @@ from utils.data_processor import (
 )
 from utils.invoice_parser import ingest_multiple_invoices
 
+# ── Load Gemini API key from Streamlit secrets (if available) ─
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", None)
+if GEMINI_KEY == "paste-your-key-here":
+    GEMINI_KEY = None  # treat placeholder as no key
+
+
 # ── Page Config ───────────────────────────────────────────────
 st.set_page_config(
     page_title="MSME Procurement Intelligence",
@@ -77,8 +83,12 @@ with st.sidebar:
             # ── Sales: Individual Invoice PDFs ──────────────────
             if sales_mode == "Individual GST Invoice PDFs" and sales_pdfs:
                 try:
+                    if GEMINI_KEY:
+                        st.info("🤖 Using Gemini AI to parse invoices...")
+                    else:
+                        st.warning("⚠ No Gemini API key — using basic parser. Add key to .streamlit/secrets.toml for AI parsing.")
                     file_list = [(f.name, f.read()) for f in sales_pdfs]
-                    df, errs = ingest_multiple_invoices(file_list)
+                    df, errs = ingest_multiple_invoices(file_list, api_key=GEMINI_KEY)
 
                     if errs:
                         for e in errs:
