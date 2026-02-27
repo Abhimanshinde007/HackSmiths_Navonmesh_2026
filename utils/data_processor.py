@@ -1,215 +1,323 @@
+"""
+Data Processing Engine - PDR v2
+Predictive Inventory & Procurement Intelligence Platform
+
+Modules:
+  4.1 - Intelligent Sales Register Ingestion
+  4.2 - Anchor Customer Identification
+  4.3 - Reorder Prediction Engine
+  4.4 - BOM Upload & Mapping
+  4.5 - Raw Material Forecast
+"""
+
 import pandas as pd
 import numpy as np
 
-def extract_true_dataframe(df):
-    """Finds the true header row in an Excel sheet that might have metadata/letterheads on top."""
-    try:
-        if df is None or df.empty: return pd.DataFrame()
-        
-        current_cols = pd.DataFrame([df.columns.values])
-        df.columns = range(df.shape[1])
-        current_cols.columns = range(df.shape[1])
-        df = pd.concat([current_cols, df], ignore_index=True)
-        
-        df = df.dropna(how='all').reset_index(drop=True)
-        
-        keywords = ['date', 'particulars', 'customer', 'item', 'qty', 'quantity', 'amount', 'total', 'voucher', 'sku', 'value', 'gross']
-        
-        best_row_idx = 0
-        max_keywords_found = 0
-        
-        for i in range(min(20, len(df))):
-            row_values = [str(x).lower() for x in df.iloc[i].values if pd.notna(x)]
-            kw_count = sum(1 for rv in row_values for kw in keywords if kw in rv)
-            if kw_count > max_keywords_found:
-                max_keywords_found = kw_count
-                best_row_idx = i
-                
-        if max_keywords_found == 0 and len(df) > 0:
-            non_null_counts = df.head(10).notna().sum(axis=1)
-            best_row_idx = non_null_counts.idxmax()
-            
-        new_header = df.iloc[best_row_idx]
-        df = df[best_row_idx+1:]
-        df.columns = new_header
-        
-        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-        df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
-        return df
-    except Exception:
-        # Failsafe fallback
-        return pd.DataFrame()
+# ─────────────────────────────────────────────
+# 4.1 INTELLIGENT SALES REGISTER INGESTION
+# ─────────────────────────────────────────────
 
-def clean_and_standardize_sales(df):
-    try:
-        df = extract_true_dataframe(df)
-        if df.empty: return df
-        
-        col_mapping = {}
-        for col in df.columns:
-            if any(kw in col for kw in ['date', 'time', 'dt']):
-                col_mapping[col] = 'date'
-            elif any(kw in col for kw in ['customer', 'client', 'buyer', 'party', 'particulars']):
-                col_mapping[col] = 'customer'
-            elif any(kw in col for kw in ['item', 'product', 'sku', 'goods']):
-                col_mapping[col] = 'sku'
-            elif any(kw in col for kw in ['qty', 'quantity', 'volume', 'units']):
-                col_mapping[col] = 'quantity'
-            elif any(kw in col for kw in ['amount', 'price', 'total', 'revenue', 'value', 'gross']):
-                col_mapping[col] = 'revenue'
-                
-        df = df.rename(columns=col_mapping)
-        
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            
-        return df
-    except Exception:
-        return pd.DataFrame()
+SALES_HEADER_KEYWORDS = [
+    'date', 'invoice', 'voucher',
+    'party', 'customer', 'particulars', 'name',
+    'item', 'product', 'goods',
+    'qty', 'quantity', 'units'
+]
 
-def rank_anchor_customers(df):
-    try:
-        if df is None or df.empty or 'customer' not in df.columns or 'revenue' not in df.columns:
-            return pd.DataFrame()
-            
-        df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce').fillna(0)
-        
-        customer_revenue = df.groupby('customer')['revenue'].sum().reset_index()
-        customer_revenue = customer_revenue.sort_values(by='revenue', ascending=False)
-        
-        total_rev = customer_revenue['revenue'].sum()
-        if total_rev > 0:
-            customer_revenue['contribution_pct'] = (customer_revenue['revenue'] / total_rev) * 100
+COLUMN_MAP = {
+    # Date variants
+    'date': 'date', 'invoice_date': 'date', 'voucher_date': 'date',
+    'bill_date': 'date', 'transaction_date': 'date', 'dt': 'date',
+    # Customer variants
+    'party': 'customer', 'customer': 'customer', 'customer_name': 'customer',
+    'particulars': 'customer', 'client': 'customer', 'buyer': 'customer',
+    'party_name': 'customer',
+    # Product variants
+    'item': 'product', 'item_name': 'product', 'product': 'product',
+    'goods': 'product', 'description': 'product', 'particulars_1': 'product',
+    # Quantity variants
+    'qty': 'quantity', 'quantity': 'quantity', 'units': 'quantity',
+    'nos': 'quantity', 'pcs': 'quantity', 'volume': 'quantity',
+}
+
+TOTAL_KEYWORDS = ['total', 'grand total', 'sub total', 'subtotal', 'net total']
+
+
+def _detect_header_row(df_raw):
+    """Scan first 20 rows to find the true table header."""
+    best_row = 0
+    best_score = 0
+    for i in range(min(20, len(df_raw))):
+        row_values = [str(x).strip().lower() for x in df_raw.iloc[i].values if pd.notna(x)]
+        score = sum(1 for cell in row_values for kw in SALES_HEADER_KEYWORDS if kw in cell)
+        if score > best_score:
+            best_score = score
+            best_row = i
+    return best_row
+
+
+def _standardize_columns(df):
+    """Lowercase, strip, deduplicate and map column names to standard schema."""
+    df.columns = [
+        str(c).strip().lower()
+                 .replace(" ", "_")
+                 .replace(".", "_")
+                 .replace("/", "_")
+                 .replace("-", "_")
+        for c in df.columns
+    ]
+    rename = {}
+    for col in df.columns:
+        if col in COLUMN_MAP:
+            rename[col] = COLUMN_MAP[col]
         else:
-            customer_revenue['contribution_pct'] = 0
-        
-        return customer_revenue
-    except Exception:
-        return pd.DataFrame()
+            for key, std in COLUMN_MAP.items():
+                if key in col:
+                    rename[col] = std
+                    break
+    df = df.rename(columns=rename)
+    # Keep only schema columns if they exist, but don't drop extras yet
+    return df
 
-def predict_reorder_intervals(df, anchor_customers_df, top_n=5):
+
+def _is_totals_row(row):
+    """Return True if this row looks like a totals/grand-total row."""
+    for val in row.values:
+        if any(kw in str(val).lower() for kw in TOTAL_KEYWORDS):
+            return True
+    return False
+
+
+def load_sales_excel(file):
+    """
+    PDR 4.1 — Full ingestion pipeline.
+    Returns clean df with columns: [date, customer, product, quantity]
+    """
     try:
-        if df is None or df.empty or 'date' not in df.columns or 'customer' not in df.columns:
-            return pd.DataFrame()
-            
-        if anchor_customers_df is None or anchor_customers_df.empty:
-            return pd.DataFrame()
-            
-        top_customers = anchor_customers_df.head(top_n)['customer'].tolist()
-        predictions = []
-        
-        df = df.dropna(subset=['date'])
-        
-        for customer in top_customers:
-            cust_sales = df[df['customer'] == customer].sort_values(by='date')
-            
-            if 'revenue' in cust_sales.columns:
-                cust_sales = cust_sales[pd.to_numeric(cust_sales['revenue'], errors='coerce').fillna(0) > 0]
-                
-            cust_sales = cust_sales.drop_duplicates(subset=['date'])
-            
-            if len(cust_sales) > 1:
-                cust_sales['days_since_last'] = cust_sales['date'].diff().dt.days
-                avg_interval = cust_sales['days_since_last'].mean()
-                std_interval = cust_sales['days_since_last'].std()
-                
-                last_order_date = cust_sales['date'].max()
-                
-                next_expected = last_order_date + pd.Timedelta(days=avg_interval)
-                
-                if pd.isna(std_interval) or avg_interval == 0:
-                    confidence = "Low"
-                else:
-                    cv = std_interval / avg_interval
-                    if cv < 0.2: confidence = "High 🟢"
-                    elif cv < 0.5: confidence = "Medium 🟡"
-                    else: confidence = "Low 🔴"
-                    
-                predictions.append({
-                    'Customer': customer,
-                    'Last Order': last_order_date.strftime('%Y-%m-%d'),
-                    'Avg Interval (Days)': round(avg_interval, 1),
-                    'Predicted Next Order': next_expected.strftime('%Y-%m-%d'),
-                    'Confidence': confidence
+        # Read raw without any header so we can detect it
+        raw = pd.read_excel(file, header=None, dtype=str)
+        raw = raw.dropna(how='all').reset_index(drop=True)
+
+        header_row = _detect_header_row(raw)
+        df = pd.read_excel(file, header=header_row, dtype=str)
+
+        df = _standardize_columns(df)
+
+        # Remove totals rows
+        df = df[~df.apply(_is_totals_row, axis=1)]
+
+        # Ensure required columns exist
+        required = ['date', 'customer', 'quantity']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return None, f"Could not find columns: {missing}. Detected columns: {list(df.columns)}"
+
+        # Keep only schema columns that exist
+        keep_cols = [c for c in ['date', 'customer', 'product', 'quantity'] if c in df.columns]
+        df = df[keep_cols]
+
+        # Type conversion
+        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+        df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce')
+
+        # Drop nulls in required fields
+        df = df.dropna(subset=['date', 'customer', 'quantity'])
+        df = df[df['quantity'] > 0]
+
+        # Clean customer names (strip whitespace, drop all-numeric rows)
+        df['customer'] = df['customer'].astype(str).str.strip()
+        df = df[df['customer'].str.len() > 1]
+
+        df = df.reset_index(drop=True)
+        return df, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+# ─────────────────────────────────────────────
+# 4.2 ANCHOR CUSTOMER IDENTIFICATION
+# ─────────────────────────────────────────────
+
+def get_anchor_customers(df):
+    """
+    PDR 4.2 — Group, rank, return top 20% or top 5.
+    Returns df: [customer, total_quantity, order_count, contribution_pct]
+    """
+    try:
+        agg = df.groupby('customer').agg(
+            total_quantity=('quantity', 'sum'),
+            order_count=('quantity', 'count')
+        ).reset_index()
+
+        agg = agg.sort_values('total_quantity', ascending=False).reset_index(drop=True)
+
+        total = agg['total_quantity'].sum()
+        agg['contribution_pct'] = (agg['total_quantity'] / total * 100).round(2)
+
+        # Top 20% or top 5
+        top_n = max(1, min(5, int(np.ceil(len(agg) * 0.20))))
+        return agg.head(top_n), None
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# ─────────────────────────────────────────────
+# 4.3 REORDER PREDICTION ENGINE
+# ─────────────────────────────────────────────
+
+def predict_reorder(df, anchor_customers):
+    """
+    PDR 4.3 — Per-customer statistical reorder prediction.
+    Skips customers with < 3 orders.
+    Returns df: [customer, last_order, avg_interval, predicted_date,
+                 window_start, window_end, confidence_pct]
+    """
+    try:
+        results = []
+        for _, row in anchor_customers.iterrows():
+            cust = row['customer']
+            orders = df[df['customer'] == cust].sort_values('date')
+            orders = orders.drop_duplicates(subset=['date'])
+
+            if len(orders) < 3:
+                continue
+
+            intervals = orders['date'].diff().dt.days.dropna()
+            mu = intervals.mean()
+            sigma = intervals.std()
+
+            if mu <= 0 or pd.isna(mu):
+                continue
+
+            last_order = orders['date'].max()
+            predicted = last_order + pd.Timedelta(days=mu)
+            half_sigma = (sigma * 0.5) if not pd.isna(sigma) else 0
+            window_start = predicted - pd.Timedelta(days=half_sigma)
+            window_end = predicted + pd.Timedelta(days=half_sigma)
+
+            # Confidence = max(0, 100 − (σ/μ × 100))
+            if pd.isna(sigma):
+                confidence = 50.0
+            else:
+                confidence = max(0.0, round(100 - (sigma / mu * 100), 1))
+
+            results.append({
+                'Customer': cust,
+                'Last Order': last_order.strftime('%d %b %Y'),
+                'Avg Interval (Days)': round(mu, 1),
+                'Predicted Next Order': predicted.strftime('%d %b %Y'),
+                'Window Start': window_start.strftime('%d %b %Y'),
+                'Window End': window_end.strftime('%d %b %Y'),
+                'Confidence %': confidence
+            })
+
+        return pd.DataFrame(results), None
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# ─────────────────────────────────────────────
+# 4.4 BOM UPLOAD & MAPPING
+# ─────────────────────────────────────────────
+
+BOM_COLUMN_MAP = {
+    'finished_good': ['finished', 'product', 'fg', 'item', 'goods'],
+    'raw_material':  ['raw', 'rm', 'material', 'component', 'input'],
+    'qty_per_unit':  ['qty', 'quantity', 'required', 'units', 'per_unit', 'ratio'],
+}
+
+
+def process_bom(file):
+    """
+    PDR 4.4 — Load and standardize BOM file.
+    Returns df: [finished_good, raw_material, qty_per_unit]
+    """
+    try:
+        raw = pd.read_excel(file, header=None, dtype=str)
+        raw = raw.dropna(how='all').reset_index(drop=True)
+        header_row = _detect_header_row(raw)
+        df = pd.read_excel(file, header=header_row, dtype=str)
+
+        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+        rename = {}
+        for std_name, keywords in BOM_COLUMN_MAP.items():
+            for col in df.columns:
+                if any(kw in col for kw in keywords) and col not in rename:
+                    rename[col] = std_name
+                    break
+
+        df = df.rename(columns=rename)
+
+        required = ['finished_good', 'raw_material', 'qty_per_unit']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return None, f"BOM missing columns: {missing}. Found: {list(df.columns)}"
+
+        df = df[required].dropna()
+        df['qty_per_unit'] = pd.to_numeric(df['qty_per_unit'], errors='coerce')
+        df = df.dropna(subset=['qty_per_unit'])
+        return df.reset_index(drop=True), None
+
+    except Exception as e:
+        return None, str(e)
+
+
+# ─────────────────────────────────────────────
+# 4.5 RAW MATERIAL FORECAST
+# ─────────────────────────────────────────────
+
+def forecast_raw_materials(df, anchor_customers, predictions_df, bom_df):
+    """
+    PDR 4.5 — Convert predicted finished goods demand into raw material requirements.
+    Returns df: [raw_material, projected_requirement, advisory]
+    """
+    try:
+        if bom_df is None or bom_df.empty:
+            return pd.DataFrame(), "No BOM data available."
+
+        # Compute average past order quantity per anchor customer
+        avg_qty = df.groupby('customer')['quantity'].mean().reset_index()
+        avg_qty.columns = ['customer', 'avg_order_qty']
+
+        # Overall historical avg consumption per product
+        historical_avg = df.groupby('product')['quantity'].mean().reset_index() if 'product' in df.columns else pd.DataFrame()
+
+        rows = []
+        for _, cust_row in anchor_customers.iterrows():
+            cust = cust_row['customer']
+            avg_q = avg_qty[avg_qty['customer'] == cust]['avg_order_qty'].values
+            if len(avg_q) == 0:
+                continue
+            predicted_qty = avg_q[0]
+
+            # For each BOM entry, compute raw material requirement
+            for _, bom_row in bom_df.iterrows():
+                rm = bom_row['raw_material']
+                qty_pu = bom_row['qty_per_unit']
+                projected = round(predicted_qty * qty_pu, 2)
+                rows.append({
+                    'Customer': cust,
+                    'Finished Good': bom_row['finished_good'],
+                    'Raw Material': rm,
+                    'Projected Requirement': projected,
                 })
-                
-        return pd.DataFrame(predictions)
-    except Exception:
-        return pd.DataFrame()
 
-def process_stock_movement(df):
-    try:
-        df = extract_true_dataframe(df)
-        if df.empty: return df
-        
-        col_mapping = {}
-        for col in df.columns:
-            if any(kw in col for kw in ['item', 'product', 'sku', 'goods', 'particulars']):
-                col_mapping[col] = 'sku'
-            elif any(kw in col for kw in ['in', 'receipt', 'purchase', 'received', 'qty', 'quantity', 'amount']):
-                col_mapping[col] = 'stock_in'
-            elif any(kw in col for kw in ['out', 'issue', 'sales', 'consumed']):
-                col_mapping[col] = 'stock_out'
-            elif any(kw in col for kw in ['balance', 'current', 'stock']):
-                col_mapping[col] = 'current_stock'
-                
-        df = df.rename(columns=col_mapping)
-        
-        if 'sku' in df.columns:
-            target_col = 'stock_out' if 'stock_out' in df.columns else 'stock_in' if 'stock_in' in df.columns else None
-            
-            if target_col:
-                df[target_col] = pd.to_numeric(df[target_col], errors='coerce').fillna(0)
-                
-                velocity = df.groupby('sku')[target_col].sum().reset_index()
-                velocity = velocity.sort_values(by=target_col, ascending=False)
-                
-                non_zero = velocity[velocity[target_col] > 0]
-                if not non_zero.empty:
-                    quantiles = non_zero[target_col].quantile([0.33, 0.66])
-                    def categorize(val):
-                        if pd.isna(val) or val == 0: return 'No Movement'
-                        elif val <= quantiles[0.33]: return 'Low Volume'
-                        elif val <= quantiles[0.66]: return 'Steady Volume'
-                        else: return 'High Volume'
-                        
-                    velocity['category'] = velocity[target_col].apply(categorize)
-                else:
-                    velocity['category'] = 'No Movement'
-                
-                if 'current_stock' in df.columns:
-                    df['current_stock'] = pd.to_numeric(df['current_stock'], errors='coerce')
-                    curr_stock = df.groupby('sku')['current_stock'].last().reset_index()
-                    velocity = pd.merge(velocity, curr_stock, on='sku', how='left')
-                    
-                return velocity
-            
-        return df
-    except Exception:
-        return pd.DataFrame()
+        if not rows:
+            return pd.DataFrame(), None
 
-def map_bom_to_raw_materials(bom_df, predicted_orders_df):
-    try:
-        if bom_df is None or bom_df.empty or predicted_orders_df is None or predicted_orders_df.empty:
-            return pd.DataFrame()
-            
-        bom_df = extract_true_dataframe(bom_df)
-        if bom_df.empty: return bom_df
-        
-        col_mapping = {}
-        for col in bom_df.columns:
-            if any(kw in col for kw in ['finished', 'product', 'fg', 'item']):
-                col_mapping[col] = 'finished_good'
-            elif any(kw in col for kw in ['raw', 'rm', 'material', 'component']):
-                col_mapping[col] = 'raw_material'
-            elif any(kw in col for kw in ['qty', 'quantity', 'required', 'units']):
-                col_mapping[col] = 'quantity_required'
-                
-        bom_df = bom_df.rename(columns=col_mapping)
-        
-        if not all(col in bom_df.columns for col in ['finished_good', 'raw_material', 'quantity_required']):
-            return bom_df
-            
-        return bom_df
-    except Exception:
-        return pd.DataFrame()
+        result = pd.DataFrame(rows)
+        result = result.groupby('Raw Material')['Projected Requirement'].sum().reset_index()
+
+        # Rule-based advisory
+        result['Advisory'] = result['Projected Requirement'].apply(
+            lambda x: '🔴 Prepare / Procure Soon' if x > result['Projected Requirement'].mean() else '🟡 Monitor'
+        )
+
+        return result.sort_values('Projected Requirement', ascending=False).reset_index(drop=True), None
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
