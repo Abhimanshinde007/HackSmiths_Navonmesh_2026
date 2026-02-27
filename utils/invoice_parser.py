@@ -1,12 +1,13 @@
 """
 Gemini AI-Powered GST Invoice Parser
-Uses Google Gemini Flash to read raw PDF text and extract structured invoice data.
-Falls back to regex parser if no API key is available.
+Reads PDF text page by page, sends each page to Gemini Flash to extract
+structured invoice data. Falls back to regex if no API key.
 """
 
 import io
 import re
 import json
+import time
 import pandas as pd
 
 try:
@@ -23,140 +24,182 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────
-# PDF TEXT EXTRACTION (shared)
+# PDF READING
 # ─────────────────────────────────────────────────────────────
 
-def _read_pdf_text(file_bytes):
-    """Extract all raw text from a PDF. Returns (text, error)."""
+def _read_pdf_pages(file_bytes):
+    """Extract text page-by-page. Returns ([(page_num, text), ...], error)."""
     if not PDF_AVAILABLE:
-        return None, "pdfplumber not installed."
+        return [], "pdfplumber not installed."
     try:
-        lines = []
+        pages = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             if not pdf.pages:
-                return None, "Empty PDF."
-            for page in pdf.pages:
+                return [], "Empty PDF."
+            for i, page in enumerate(pdf.pages):
                 t = page.extract_text(x_tolerance=3, y_tolerance=3)
-                if t:
-                    lines.extend(t.splitlines())
-        if not lines:
-            return None, "Scanned PDF — no extractable text. Use text-based Tally export."
-        return '\n'.join(lines), None
+                if t and t.strip():
+                    pages.append((i + 1, t.strip()))
+        if not pages:
+            return [], "Scanned PDF — no extractable text. Use text-based Tally export."
+        return pages, None
     except Exception as e:
-        return None, f"PDF read error: {str(e)}"
+        return [], f"PDF read error: {str(e)}"
 
 
 # ─────────────────────────────────────────────────────────────
-# GEMINI AI EXTRACTION
+# GEMINI AI
 # ─────────────────────────────────────────────────────────────
 
 GEMINI_PROMPT = """You are a data extraction assistant for Indian GST invoices.
 
-Given the raw text extracted from a Tally-generated GST Invoice PDF, extract the following fields and return ONLY valid JSON with no explanation or markdown.
+Given the raw text of ONE Tally GST Invoice page, extract and return ONLY valid JSON.
 
 Required JSON structure:
 {
   "date": "DD-Mon-YY or DD/MM/YYYY string, or null",
-  "invoice_no": "invoice number string like AE/25-26/1316 or 322",
-  "customer": "exact buyer company name (from Buyer / Bill to section only — NOT the seller, NOT vehicle number, NOT address)",
+  "invoice_no": "invoice number string, or null",
+  "customer": "exact buyer company name from Buyer/Bill to section ONLY — NOT the seller, NOT vehicle number",
   "products": [
     {
-      "description": "product/item description",
-      "quantity": numeric_value_or_null,
-      "unit": "NOS/PCS/KG/etc or empty string",
-      "amount": numeric_invoice_value_or_null
+      "description": "product or item description",
+      "quantity": numeric_or_null,
+      "unit": "NOS/PCS/KG/MTR/SET or empty string",
+      "amount": numeric_line_item_amount_in_rupees_or_null
     }
   ]
 }
 
-Rules:
-- customer must be the BUYER company name only (the party who is purchasing)
-- Ignore SGST, CGST, IGST, Total rows in products
-- Ignore sub-descriptions, material notes, italic lines below the main product line
-- quantity should be the physical unit count (like 30, 1000), not rupee amounts
-- amount should be the line item amount in rupees (like 9300.00, 12500.00)
-- If a field is not found, use null
-- Return only the JSON object, nothing else
+Critical rules:
+- customer = the BUYER party only (after Buyer/Bill to label)
+- EXCLUDE: SGST, CGST, IGST, Output Tax, Total, tax rows from products
+- EXCLUDE: vehicle numbers (MH12CT1998), dispatch info, delivery terms
+- EXCLUDE: sub-description italic lines below main product
+- quantity = physical unit count (30, 1000), NOT rupee amounts
+- amount = line item value in rupees (9300.00, 12500.00)
+- If no products, return products as []
+- Return ONLY the JSON object, no markdown, no explanation
 
 Invoice text:
 """
 
 
-def _parse_with_gemini(text, api_key):
-    """Send invoice text to Gemini Flash and return structured dict."""
+def _gemini_parse_page(page_text, api_key):
+    """Parse one invoice page via Gemini. Returns (dict, error)."""
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         response = model.generate_content(
-            GEMINI_PROMPT + text,
+            GEMINI_PROMPT + page_text[:4000],
             generation_config=genai.types.GenerationConfig(
                 temperature=0,
-                max_output_tokens=1024,
+                max_output_tokens=512,
             )
         )
         raw = response.text.strip()
-        # Strip markdown code fences if present
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
         raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
         return json.loads(raw), None
     except json.JSONDecodeError as e:
-        return None, f"Gemini returned non-JSON: {str(e)}"
+        return None, f"JSON error: {e}"
     except Exception as e:
-        return None, f"Gemini API error: {str(e)}"
+        err = str(e)
+        if '429' in err:
+            return None, "RATE_LIMIT"
+        return None, f"API error: {err}"
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN INVOICE PARSER
+# MAIN PARSER
 # ─────────────────────────────────────────────────────────────
+
+SKIP_PRODUCT_KEYWORDS = [
+    'sgst', 'cgst', 'igst', 'output cgst', 'output sgst',
+    'total', 'grand total', 'amount in words', 'taxable value',
+    'central tax', 'state tax', 'output tax'
+]
+
 
 def parse_gst_invoice_pdf(file_bytes, api_key=None):
     """
-    Parse a single Tally GST invoice PDF.
-    Uses Gemini AI if api_key is provided, otherwise uses regex fallback.
+    Parse a Tally GST Invoice PDF (single or merged multi-invoice).
+    Processes page-by-page to stay within token/rate limits.
     Returns (list_of_row_dicts, error_string).
     """
-    text, err = _read_pdf_text(file_bytes)
+    pages, err = _read_pdf_pages(file_bytes)
     if err:
         return [], err
-    if not text or len(text.strip()) < 50:
+    if not pages:
         return [], "Scanned PDF — no extractable text."
 
-    # ── Gemini path ────────────────────────────────────────────
+    # ── Gemini path: one call per page ─────────────────────────
     if api_key and GEMINI_AVAILABLE:
-        data, err = _parse_with_gemini(text, api_key)
-        if err:
-            return [], f"AI parse failed: {err}"
+        all_rows = []
+        page_errors = []
 
-        customer = data.get('customer') or 'UNKNOWN'
-        date_val = data.get('date')
-        invoice_no = data.get('invoice_no') or 'UNKNOWN'
-        products = data.get('products') or []
-
-        rows = []
-        for p in products:
-            desc = str(p.get('description') or '').strip()
-            if not desc or len(desc) < 3:
+        for idx, (page_num, page_text) in enumerate(pages):
+            if len(page_text.strip()) < 50:
                 continue
-            rows.append({
-                'date':       date_val,
-                'invoice_no': invoice_no,
-                'customer':   customer,
-                'product':    desc,
-                'quantity':   p.get('quantity'),
-                'unit':       p.get('unit') or '',
-                'amount':     p.get('amount'),
-            })
 
-        if not rows:
-            return [], f"Gemini extracted 0 products. Customer={customer}, Invoice={invoice_no}"
-        return rows, None
+            data, perr = _gemini_parse_page(page_text, api_key)
 
-    # ── Regex fallback (no API key) ────────────────────────────
-    return _regex_parse(text)
+            if perr == "RATE_LIMIT":
+                page_errors.append(f"Page {page_num}: rate limit hit — waiting 30s")
+                time.sleep(30)
+                # Retry once
+                data, perr = _gemini_parse_page(page_text, api_key)
+                if perr:
+                    page_errors.append(f"Page {page_num}: {perr}")
+                    continue
 
+            elif perr:
+                page_errors.append(f"Page {page_num}: {perr}")
+                continue
+
+            if not data:
+                continue
+
+            customer   = str(data.get('customer') or 'UNKNOWN').strip()
+            date_val   = data.get('date')
+            invoice_no = str(data.get('invoice_no') or 'UNKNOWN').strip()
+            products   = data.get('products') or []
+
+            for p in products:
+                desc = str(p.get('description') or '').strip()
+                if not desc or len(desc) < 3:
+                    continue
+                if any(kw in desc.lower() for kw in SKIP_PRODUCT_KEYWORDS):
+                    continue
+                all_rows.append({
+                    'date':       date_val,
+                    'invoice_no': invoice_no,
+                    'customer':   customer,
+                    'product':    desc,
+                    'quantity':   p.get('quantity'),
+                    'unit':       str(p.get('unit') or ''),
+                    'amount':     p.get('amount'),
+                })
+
+            # Small delay between pages to respect rate limits
+            if idx < len(pages) - 1:
+                time.sleep(1)
+
+        if not all_rows and page_errors:
+            return [], "AI parse failed: " + "; ".join(page_errors)
+
+        return all_rows, None
+
+    # ── Regex fallback (no API key) ─────────────────────────────
+    full_text = '\n'.join(t for _, t in pages)
+    return _regex_parse(full_text)
+
+
+# ─────────────────────────────────────────────────────────────
+# REGEX FALLBACK
+# ─────────────────────────────────────────────────────────────
 
 def _regex_parse(text):
-    """Simple regex fallback when no Gemini key is set."""
+    """Best-effort regex parser for when no Gemini key is set."""
     lines = text.splitlines()
 
     # Date
@@ -166,25 +209,30 @@ def _regex_parse(text):
         m = re.search(r'\b(\d{1,2}[/]\d{1,2}[/]\d{4})\b', text)
         date_val = m.group(1) if m else None
 
-    # Invoice no
+    # Invoice number
     m = re.search(r'\b([A-Z]{1,6}[/\-]\d{2,4}[/\-]\d{2,4}[/\-]\d{1,6})\b', text)
+    if not m:
+        m = re.search(r'\b([A-Z]{1,6}[/\-]\d{1,6})\b', text)
     invoice_no = m.group(1) if m else 'UNKNOWN'
 
-    # Customer — look for company indicators in Buyer section
+    # Customer
     customer = None
-    buyer_section = False
     SKIP = ['gstin', 'state', 'contact', 'udyam', 'iso', 'certified', 'invoice',
             'dated', 'voucher', 'mode', 'payment', 'buyer', 'bill to', 'dispatch',
             'destination', 'vehicle', 'lading', 'delivery', 'term', 'place', 'supply', 'road']
+    buyer_section = False
     for line in lines:
         l, ll = line.strip(), line.strip().lower()
         if re.search(r'buyer\s*[\(\[]?\s*bill\s+to', ll) or ll.startswith('buyer') or 'bill to' in ll:
             buyer_section = True
             continue
         if buyer_section:
-            if not l or len(l) < 5: continue
-            if any(kw in ll for kw in SKIP): continue
-            if re.match(r'^[A-Z]{2}\d{2}[A-Z]{2}\d{4}$', l): continue  # skip vehicle numbers
+            if not l or len(l) < 5:
+                continue
+            if any(kw in ll for kw in SKIP):
+                continue
+            if re.match(r'^[A-Z]{2}\d{2}[A-Z]{2}\d{4}$', l):
+                continue  # skip vehicle numbers
             l = re.sub(r'\s+\d{1,2}[-/]\w{3,9}[-/]\d{2,4}\s*$', '', l).strip()
             if l and len(l) > 5:
                 customer = l
@@ -196,16 +244,11 @@ def _regex_parse(text):
                 customer = line.strip()
                 break
 
-    # Items — look for lines with amount at end
+    # Items
     HEADER_KW = ['description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate']
-    SKIP_KW = ['sgst', 'cgst', 'igst', 'output', 'total', 'tax', 'amount in words',
-               'chargeable', 'declaration', 'bank', 'authoris', 'e. & o.e', 'taxable value',
-               'central tax', 'state tax', 'material', 'sec-']
-
     hdr_idx = None
     for i, line in enumerate(lines):
-        hits = sum(1 for kw in HEADER_KW if kw in line.lower())
-        if hits >= 3:
+        if sum(1 for kw in HEADER_KW if kw in line.lower()) >= 3:
             hdr_idx = i
             break
 
@@ -213,18 +256,18 @@ def _regex_parse(text):
     if hdr_idx is not None:
         for line in lines[hdr_idx + 1:]:
             l = line.strip()
-            if not l: continue
-            ll = l.lower()
-            if any(kw in ll for kw in SKIP_KW): continue
-            has_amount = bool(re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}\s*$', l))
-            if not has_amount: continue
-            # Skip obvious non-product lines (only numbers/tax rows)
-            if re.match(r'^[\d\s%,\.]+$', l): continue
+            if not l:
+                continue
+            if any(kw in l.lower() for kw in SKIP_PRODUCT_KEYWORDS):
+                continue
+            if not re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}\s*$', l):
+                continue
+            if re.match(r'^[\d\s%,\.]+$', l):
+                continue
 
-            nums = [float(n.replace(',', '')) for n in re.findall(r'[\d,]+\.\d{2}', l) if n.replace(',','').replace('.','').isdigit() or True]
+            nums = [float(n.replace(',', '')) for n in re.findall(r'[\d,]+\.\d{2}', l)]
             desc = re.sub(r'^\d+\s+', '', l)
             desc = re.sub(r'\s+\d{4,}.*$', '', desc).strip()
-
             qty_m = re.search(r'(\d+(?:\.\d+)?)\s*(?:NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\.?', l, re.IGNORECASE)
             qty = float(qty_m.group(1)) if qty_m else None
             unit_m = re.search(r'\b(NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\b', l, re.IGNORECASE)
@@ -235,12 +278,11 @@ def _regex_parse(text):
                 items.append({'description': desc, 'quantity': qty, 'unit': unit, 'amount': amount})
 
     if not items:
-        return [], f"No product rows found. Date={date_val}, Customer={customer}. Please set GEMINI_API_KEY for AI-powered parsing."
+        return [], "No product rows found. Set GEMINI_API_KEY in .streamlit/secrets.toml for AI-powered parsing."
 
-    rows = [{'date': date_val, 'invoice_no': invoice_no, 'customer': customer or 'UNKNOWN',
+    return [{'date': date_val, 'invoice_no': invoice_no, 'customer': customer or 'UNKNOWN',
              'product': it['description'], 'quantity': it['quantity'],
-             'unit': it['unit'], 'amount': it['amount']} for it in items]
-    return rows, None
+             'unit': it['unit'], 'amount': it['amount']} for it in items], None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -249,10 +291,11 @@ def _regex_parse(text):
 
 def ingest_multiple_invoices(file_list, api_key=None):
     """
-    Parse a list of (filename, bytes) tuples.
+    Parse a list of (filename, bytes) tuples as GST invoices.
     Returns (combined_df, list_of_errors).
     """
     all_rows, errors = [], []
+
     for fname, fbytes in file_list:
         rows, err = parse_gst_invoice_pdf(fbytes, api_key=api_key)
         if err:
