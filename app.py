@@ -59,8 +59,15 @@ if 'processed' not in st.session_state:
 # ─────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────
-st.markdown("# 🏭 Enterprise Inventory Intelligence")
-st.markdown("*Predictive procurement & stock analytics for MSMEs — ERP grade*")
+col_title, col_btn = st.columns([0.85, 0.15])
+with col_title:
+    st.markdown("# 🏭 Enterprise Inventory Intelligence")
+    st.markdown("*Predictive procurement & stock analytics for MSMEs — ERP grade*")
+with col_btn:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh Data", help="Reload data from cache and refresh views", use_container_width=True):
+        st.session_state.loaded_once = False
+        st.rerun()
 st.markdown("---")
 
 tab_dash, tab_bom, tab_commodity, tab_ingest = st.tabs([
@@ -250,7 +257,7 @@ with tab_dash:
                 if not trend_df.empty:
                     st.markdown("**Sales Volume Trend**")
                     daily = trend_df.groupby('date')['quantity'].sum().reset_index()
-                    st.line_chart(daily.set_index('date'))
+                    st.bar_chart(daily.set_index('date'))
 
             if anchor_df is not None and not anchor_df.empty:
                 st.markdown("**Core Revenue Drivers (Anchor Clients)**")
@@ -360,6 +367,11 @@ with tab_bom:
 
     elif bom_df is not None and not bom_df.empty:
         st.info("BOM loaded. Upload Sales Bills to generate reorder predictions and compute material requirements.")
+        st.markdown("**Raw Bill of Materials Mapping**")
+        st.dataframe(
+            bom_df.assign(**{"SR. NO.": range(1, len(bom_df)+1)}).set_index("SR. NO."),
+            use_container_width=True, height=400
+        )
     else:
         st.info("Upload your **BOM file** in the Data Ingestion tab to activate Procurement Alerts.")
 

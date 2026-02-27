@@ -1349,7 +1349,12 @@ def compute_material_requirements(predictions_df, bom_df, stock_summary_df):
             return pd.DataFrame(), "Could not match any BOM entries to predictions."
 
         result = pd.DataFrame(rows)
-        result = result.sort_values(['Days Till Order', 'Status'], ascending=[True, False])
+        
+        # Sort by urgency (BUY NOW > PREPARE > CHECK STOCK > OK)
+        severity_map = {'BUY NOW': 1, 'PREPARE': 2, 'CHECK STOCK': 3, 'OK': 4}
+        result['Severity'] = result['Status'].map(severity_map)
+        result = result.sort_values(['Severity', 'Days Till Order'], ascending=[True, True]).drop(columns=['Severity'])
+        
         return result, None
 
     except Exception as e:
