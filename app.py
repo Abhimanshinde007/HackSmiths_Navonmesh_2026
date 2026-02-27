@@ -1,306 +1,384 @@
-"""
-Predictive Inventory & Procurement Intelligence Platform
-Full MVP — Streamlit Frontend
-Supports: Individual GST Invoice PDFs, Sales Register Excel, Purchase & Inward/Outward Registers
-"""
-
 import streamlit as st
 import pandas as pd
 
 from utils.data_processor import (
     ingest_sales_excel,
-    get_anchor_customers, predict_reorder,
-    ingest_inout_excel, ingest_inout_pdf, compute_stock,
-    ingest_purchase_excel, ingest_purchase_pdf, compute_purchase_summary,
+    ingest_purchase_excel,
+    ingest_stock_excel,
+    get_anchor_customers,
+    predict_reorder,
+    compute_stock,
     material_outlook,
 )
-from utils.invoice_parser import ingest_multiple_invoices
 
-# ── Load Gemini API key from Streamlit secrets (if available) ─
-GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", None)
-if GEMINI_KEY == "paste-your-key-here":
-    GEMINI_KEY = None  # treat placeholder as no key
-
-
-# ── Page Config ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="MSME Procurement Intelligence",
+    page_title="Inventory Intelligence Engine",
     page_icon="🏭",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# ── CSS ───────────────────────────────────────────────────────
-try:
-    with open("style.css") as f:
-        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-except FileNotFoundError:
-    pass
+# ─────────────────────────────────────────────────────────────
+# STYLING
+# ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-# ── Session State ─────────────────────────────────────────────
-_keys = ["sales_df", "inout_df", "purchase_df",
-         "anchor_df", "predictions_df", "stock_df",
-         "purchase_summary", "outlook_df", "processed",
-         "sales_qty_label", "sales_invoice_count"]
-for k in _keys:
-    if k not in st.session_state:
-        st.session_state[k] = None
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-# ── Sidebar ───────────────────────────────────────────────────
+/* Background */
+.stApp { background-color: #F0F2F6; }
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background-color: #0B3D91;
+    color: white;
+}
+[data-testid="stSidebar"] .stMarkdown h1,
+[data-testid="stSidebar"] .stMarkdown h2,
+[data-testid="stSidebar"] .stMarkdown h3,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label { color: white !important; }
+[data-testid="stSidebar"] .stFileUploader label { color: white !important; }
+[data-testid="stSidebar"] .stButton>button {
+    background-color: #F4B400;
+    color: #0B3D91;
+    font-weight: 700;
+    border: none;
+    border-radius: 6px;
+    padding: 0.5rem 1rem;
+    width: 100%;
+}
+[data-testid="stSidebar"] .stButton>button:hover {
+    background-color: #e0a200;
+    color: #0B3D91;
+}
+
+/* KPI Cards */
+.kpi-row { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+.kpi-card {
+    background: white;
+    border-radius: 10px;
+    padding: 18px 24px;
+    flex: 1;
+    min-width: 160px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border-left: 5px solid #0B3D91;
+}
+.kpi-card .kpi-label { font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi-card .kpi-value { font-size: 32px; font-weight: 700; color: #0B3D91; margin-top: 4px; }
+.kpi-card .kpi-value.accent { color: #F4B400; }
+
+/* Panel headers */
+.panel-header {
+    background: #0B3D91;
+    color: white;
+    padding: 10px 16px;
+    border-radius: 8px 8px 0 0;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 0.04em;
+}
+
+/* Status badges */
+.badge-buy  { background:#d32f2f; color:white; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+.badge-prep { background:#F4B400; color:#0B3D91; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+.badge-mon  { background:#388e3c; color:white; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+
+/* Divider */
+hr { border: none; border-top: 1px solid #ddd; margin: 12px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# SESSION STATE
+# ─────────────────────────────────────────────────────────────
+for key in ['sales_df', 'purchase_df', 'stock_df',
+            'anchor_df', 'predictions_df', 'stock_summary',
+            'outlook_df', 'processed']:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+if 'processed' not in st.session_state:
+    st.session_state.processed = False
+
+
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR — UPLOAD PANELS
+# ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🏭 MSME Data Ingestion")
+    st.markdown("# 🏭 Inventory Intelligence")
+    st.markdown("*MSME-grade procurement intelligence*")
     st.markdown("---")
 
-    # ── Sales Section ─────────────────────────────────────────
-    st.markdown("### 📊 Sales Data")
-    st.caption("Choose your format:")
-    sales_mode = st.radio("Sales upload type", ["Individual GST Invoice PDFs", "Sales Register (Excel)"],
-                          key="sales_mode_radio", label_visibility="collapsed")
+    # Sales Bills
+    st.markdown("### 📊 Sales Bills")
+    st.caption("Upload one or more Excel sales bills")
+    sales_files = st.file_uploader(
+        "Sales Bills", type=["xlsx", "xls"],
+        accept_multiple_files=True, key="sales_up"
+    )
 
-    if sales_mode == "Individual GST Invoice PDFs":
-        st.caption("📄 Upload Tally GST Invoices (PDF or Converted Excel)")
-        sales_pdfs = st.file_uploader("Upload Invoice Files", type=["pdf", "xlsx", "xls"],
-                                       accept_multiple_files=True, key="sales_pdf_up")
-        sales_excel = None
+    st.markdown("### 🛒 Purchase Bills")
+    st.caption("Upload one or more Excel purchase bills")
+    purchase_files = st.file_uploader(
+        "Purchase Bills", type=["xlsx", "xls"],
+        accept_multiple_files=True, key="purch_up"
+    )
 
+    st.markdown("### 📦 Stock Register")
+    st.caption("Upload Excel inward/outward register")
+    stock_file = st.file_uploader(
+        "Stock Register", type=["xlsx", "xls"],
+        key="stock_up"
+    )
+
+    st.markdown("---")
+    run_btn = st.button("▶ Process & Generate Insights", use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# PROCESSING
+# ─────────────────────────────────────────────────────────────
+if run_btn:
+    if not sales_files and not purchase_files and not stock_file:
+        st.warning("Please upload at least one file before processing.")
     else:
-        st.caption("📊 Upload a consolidated Sales Register Excel")
-        sales_excel = st.file_uploader("Upload Sales Register Excel", type=["xlsx", "xls"],
-                                        key="sales_excel_up")
-        sales_pdfs = None
+        with st.spinner("Processing files..."):
 
-    st.markdown("### 📦 Inward / Outward Register")
-    inout_file = st.file_uploader("Upload Stock Register (.xlsx / .pdf)", type=["xlsx", "xls", "pdf"], key="inout_up")
-
-    st.markdown("### 🛒 Purchase Register")
-    purchase_file = st.file_uploader("Upload Purchase Register (.xlsx / .pdf)", type=["xlsx", "xls", "pdf"], key="purch_up")
-
-    st.markdown("---")
-    run_btn = st.button("▶ Process & Run Insights", use_container_width=True)
-
-    if run_btn:
-        with st.spinner("Processing all registers..."):
-
-            # ── Sales: Individual Invoice PDFs ──────────────────
-            if sales_mode == "Individual GST Invoice PDFs" and sales_pdfs:
-                try:
-                    if GEMINI_KEY:
-                        st.info("🤖 Using Gemini AI to parse invoices...")
+            # ── Sales ────────────────────────────────────────
+            if sales_files:
+                df_s, errs_s = ingest_sales_excel(sales_files)
+                for e in errs_s:
+                    st.sidebar.error(f"⚠ {e}")
+                if df_s is not None and not df_s.empty:
+                    st.session_state.sales_df = df_s
+                    anchor, aerr = get_anchor_customers(df_s)
+                    if aerr:
+                        st.sidebar.warning(f"Anchor: {aerr}")
                     else:
-                        st.warning("⚠ No Gemini API key — using basic parser. Add key to .streamlit/secrets.toml for AI parsing.")
-                    file_list = [(f.name, f.read()) for f in sales_pdfs]
-                    df, errs = ingest_multiple_invoices(file_list, api_key=GEMINI_KEY)
-
-                    if errs:
-                        for e in errs:
-                            st.warning(f"⚠ {e}")
-
-                    if df is not None and not df.empty:
-                        # Drop physical qty column, use invoice amount as 'quantity' for ranking
-                        # (amount = invoice value in ₹, more meaningful for MSME ranking)
-                        df_std = df.drop(columns=['quantity'], errors='ignore').rename(columns={'amount': 'quantity'})
-
-                        st.session_state.sales_df = df_std
-                        st.session_state.sales_qty_label = 'Invoice Value (₹)'
-                        st.session_state.sales_invoice_count = len(sales_pdfs)
-
-                        anchor, aerr = get_anchor_customers(df_std)
                         st.session_state.anchor_df = anchor
-                        pred, _ = predict_reorder(df_std, anchor)
-                        st.session_state.predictions_df = pred
-                        st.success(f"✅ Parsed {len(sales_pdfs)} invoices → {len(df):,} line items | {df['customer'].nunique()} customers")
-                    else:
-                        st.error("Could not extract data from the uploaded PDFs.")
-                except Exception as e:
-                    st.error(f"Invoice parsing error: {e}")
+                        pred, perr = predict_reorder(df_s, anchor)
+                        if not perr:
+                            st.session_state.predictions_df = pred
+                    st.sidebar.success(f"✅ Sales: {len(df_s):,} rows | {df_s['customer'].nunique()} customers")
+                else:
+                    if not errs_s:
+                        st.sidebar.warning("Sales: No valid rows extracted.")
 
-            # ── Sales: Excel Register ───────────────────────────
-            elif sales_mode == "Sales Register (Excel)" and sales_excel:
-                try:
-                    df, err, qty_label = ingest_sales_excel(sales_excel)
-                    if err:
-                        st.error(f"Sales Excel: {err}")
-                    else:
-                        st.session_state.sales_df = df
-                        st.session_state.sales_qty_label = qty_label or 'Value'
-                        anchor, _ = get_anchor_customers(df)
-                        st.session_state.anchor_df = anchor
-                        pred, _ = predict_reorder(df, anchor)
-                        st.session_state.predictions_df = pred
-                        st.success(f"✅ Sales loaded: {len(df):,} rows | {df['customer'].nunique()} customers")
-                except Exception as e:
-                    st.error(f"Sales Excel error: {e}")
+            # ── Purchases ────────────────────────────────────
+            if purchase_files:
+                df_p, errs_p = ingest_purchase_excel(purchase_files)
+                for e in errs_p:
+                    st.sidebar.error(f"⚠ {e}")
+                if df_p is not None and not df_p.empty:
+                    st.session_state.purchase_df = df_p
+                    st.sidebar.success(f"✅ Purchase: {len(df_p):,} rows")
 
-            # ── Inward / Outward ────────────────────────────────
-            if inout_file:
-                try:
-                    if inout_file.name.lower().endswith(".pdf"):
-                        df_io, err = ingest_inout_pdf(inout_file.read())
-                    else:
-                        df_io, err = ingest_inout_excel(inout_file)
-                    if err:
-                        st.error(f"Stock Register: {err}")
-                    else:
-                        st.session_state.inout_df = df_io
-                        stock, _ = compute_stock(df_io)
-                        st.session_state.stock_df = stock
-                        st.success(f"✅ Stock register: {df_io['material'].nunique()} materials")
-                except Exception as e:
-                    st.error(f"Stock register error: {e}")
+            # ── Stock ────────────────────────────────────────
+            if stock_file:
+                df_io, err_io = ingest_stock_excel(stock_file)
+                if err_io:
+                    st.sidebar.error(f"⚠ Stock: {err_io}")
+                elif df_io is not None and not df_io.empty:
+                    st.session_state.stock_df = df_io
+                    summary, _ = compute_stock(df_io)
+                    st.session_state.stock_summary = summary
+                    # Material outlook
+                    outlook, _ = material_outlook(
+                        df_io,
+                        st.session_state.predictions_df,
+                        st.session_state.sales_df,
+                    )
+                    st.session_state.outlook_df = outlook
+                    st.sidebar.success(f"✅ Stock: {df_io['material'].nunique()} materials")
 
-            # ── Purchase ────────────────────────────────────────
-            if purchase_file:
-                try:
-                    if purchase_file.name.lower().endswith(".pdf"):
-                        df_p, err = ingest_purchase_pdf(purchase_file.read())
-                    else:
-                        df_p, err = ingest_purchase_excel(purchase_file)
-                    if err:
-                        st.error(f"Purchase Register: {err}")
-                    else:
-                        st.session_state.purchase_df = df_p
-                        summary, _ = compute_purchase_summary(df_p)
-                        st.session_state.purchase_summary = summary
-                        st.success(f"✅ Purchase register: {len(df_p):,} rows")
-                except Exception as e:
-                    st.error(f"Purchase register error: {e}")
+            st.session_state.processed = True
+        st.rerun()
 
-            # ── Material Outlook ────────────────────────────────
-            if st.session_state.stock_df is not None and not st.session_state.stock_df.empty:
-                outlook, _ = material_outlook(
-                    st.session_state.stock_df,
-                    st.session_state.predictions_df,
-                    st.session_state.sales_df
-                )
-                st.session_state.outlook_df = outlook
 
-            if (sales_pdfs or sales_excel or inout_file or purchase_file):
-                st.session_state.processed = True
-
-# ── Main Dashboard ────────────────────────────────────────────
-st.markdown("# 🏭 Predictive Inventory & Procurement Dashboard")
-st.markdown("*MSME-grade procurement intelligence — no ERP required.*")
+# ─────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────
+st.markdown("# 🏭 Inventory Intelligence Engine")
+st.markdown("*Predictive procurement analytics for MSMEs — no ERP required*")
 st.markdown("---")
 
 if not st.session_state.processed:
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.info("**Step 1 — Sales Data**\nUpload individual Tally GST Invoice PDFs (multiple at once) OR a Sales Register Excel from the sidebar.")
+        st.info("**Step 1 → Sales Bills**\nUpload your Excel sales invoices in the sidebar.")
     with col2:
-        st.info("**Step 2 — Stock Register**\n(Optional) Upload Inward/Outward register to track current stock levels.")
+        st.info("**Step 2 → Purchase Bills**\nUpload your Excel purchase invoices.")
     with col3:
-        st.info("**Step 3 — Run Insights**\nClick Process to generate anchor customer predictions and material outlook.")
+        st.info("**Step 3 → Stock Register**\nUpload your inward/outward register, then click Process.")
     st.stop()
 
-# ── Three-column dashboard ────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# KPI CARDS
+# ─────────────────────────────────────────────────────────────
+sales_df     = st.session_state.sales_df
+anchor_df    = st.session_state.anchor_df
+stock_df     = st.session_state.stock_df
+purchase_df  = st.session_state.purchase_df
+predictions  = st.session_state.predictions_df
+stock_sum    = st.session_state.stock_summary
+outlook_df   = st.session_state.outlook_df
+
+total_customers  = sales_df['customer'].nunique() if sales_df is not None and not sales_df.empty else 0
+anchor_count     = len(anchor_df) if anchor_df is not None and not anchor_df.empty else 0
+total_materials  = stock_df['material'].nunique() if stock_df is not None and not stock_df.empty else 0
+stock_value_str  = f"₹{purchase_df['quantity'].sum() * purchase_df['rate'].dropna().mean():,.0f}" \
+                   if purchase_df is not None and not purchase_df.empty and 'rate' in purchase_df.columns else "N/A"
+
+st.markdown(f"""
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-label">Total Customers</div>
+    <div class="kpi-value">{total_customers}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Anchor Customers</div>
+    <div class="kpi-value accent">{anchor_count}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Total Materials</div>
+    <div class="kpi-value">{total_materials}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Predicted Reorders</div>
+    <div class="kpi-value">{len(predictions) if predictions is not None and not predictions.empty else 0}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# 3-COLUMN DASHBOARD
+# ─────────────────────────────────────────────────────────────
 col_sales, col_stock, col_outlook = st.columns(3)
 
-# ─── Column 1: Sales Insights ─────────────────────────────────
+# ── Column 1: Sales Intelligence ─────────────────────────────
 with col_sales:
-    st.markdown("### 📊 Sales Insights")
+    st.markdown('<div class="panel-header">📊 Sales Intelligence</div>', unsafe_allow_html=True)
+    st.markdown("")
 
-    if st.session_state.sales_df is not None and not st.session_state.sales_df.empty:
-        df = st.session_state.sales_df
-        inv_count = st.session_state.sales_invoice_count
-        if inv_count:
-            st.metric("Invoices Parsed", inv_count)
-        st.metric("Line Items", f"{len(df):,}")
-        st.metric("Unique Customers", f"{df['customer'].nunique():,}")
-        if 'date' in df.columns and df['date'].notna().any():
-            dr = f"{df['date'].min().strftime('%d %b %y')} → {df['date'].max().strftime('%d %b %y')}"
-            st.caption(f"Date range: {dr}")
+    if sales_df is not None and not sales_df.empty:
+        st.metric("Invoices / Line Items", f"{sales_df['source'].nunique() if 'source' in sales_df.columns else '—'} files / {len(sales_df):,}")
+        st.metric("Date Range",
+                  f"{sales_df['date'].min().strftime('%d %b %y')} → {sales_df['date'].max().strftime('%d %b %y')}"
+                  if sales_df['date'].notna().any() else "—")
 
-        if st.session_state.anchor_df is not None and not st.session_state.anchor_df.empty:
-            qty_col_label = st.session_state.get('sales_qty_label', 'Value')
-            st.markdown("**Anchor Customers**")
-            st.caption(f"📌 Ranked by: **{qty_col_label}**")
-            anchor = st.session_state.anchor_df.copy()
-            anchor.columns = ['Customer', qty_col_label, 'Orders', 'Share %']
-            st.dataframe(anchor.style.format({qty_col_label: '{:,.0f}', 'Share %': '{:.1f}%'}),
-                         use_container_width=True, height=220)
+        if anchor_df is not None and not anchor_df.empty:
+            st.markdown("**Anchor Customers** (Top 5 by Volume)")
+            st.dataframe(
+                anchor_df.style.format({'Total Qty': '{:,.0f}', 'Share %': '{:.1f}%'}),
+                use_container_width=True, height=220
+            )
 
-        if st.session_state.predictions_df is not None and not st.session_state.predictions_df.empty:
+        if predictions is not None and not predictions.empty:
             st.markdown("**Reorder Predictions**")
-            pred = st.session_state.predictions_df
-
-            def _conf_colour(val):
-                if val >= 70: return 'color: green; font-weight:bold'
-                elif val >= 40: return 'color: orange'
-                return 'color: red'
-
+            def _conf_color(val):
+                if val >= 70: return 'color: #2e7d32; font-weight:bold'
+                elif val >= 40: return 'color: #e65100'
+                return 'color: #c62828'
             try:
-                st.dataframe(pred.style.applymap(_conf_colour, subset=['Confidence %']),
-                             use_container_width=True, height=250)
+                st.dataframe(
+                    predictions.style.applymap(_conf_color, subset=['Confidence %']),
+                    use_container_width=True, height=260
+                )
             except Exception:
-                st.dataframe(pred, use_container_width=True, height=250)
+                st.dataframe(predictions, use_container_width=True, height=260)
         else:
-            st.info("Predictions require ≥ 2 orders per customer.")
+            st.info("Predictions need ≥2 order dates per customer.")
 
-        # Show raw invoice data in expander
-        if 'invoice_no' in df.columns:
-            with st.expander("View All Invoice Data"):
-                st.dataframe(df, use_container_width=True, height=300)
+        # Products breakdown
+        if 'product' in sales_df.columns:
+            with st.expander("📋 Product Line Items"):
+                prod_agg = (sales_df.groupby('product')['quantity']
+                            .sum().reset_index()
+                            .sort_values('quantity', ascending=False)
+                            .rename(columns={'product': 'Product', 'quantity': 'Total Qty'}))
+                st.dataframe(prod_agg.style.format({'Total Qty': '{:,.1f}'}),
+                             use_container_width=True, height=280)
     else:
-        st.info("Upload Sales data to see insights.")
+        st.info("Upload Sales Bills to see insights.")
 
-# ─── Column 2: Stock Status ───────────────────────────────────
+# ── Column 2: Stock Status ────────────────────────────────────
 with col_stock:
-    st.markdown("### 📦 Stock Status")
+    st.markdown('<div class="panel-header">📦 Stock Position</div>', unsafe_allow_html=True)
+    st.markdown("")
 
-    if st.session_state.stock_df is not None and not st.session_state.stock_df.empty:
-        stock = st.session_state.stock_df.copy()
-        low_stock = stock[stock['current_stock'] <= 0]
-        st.metric("Total Materials", len(stock))
-        st.metric("Low / Zero Stock", len(low_stock), delta_color="inverse")
+    if stock_sum is not None and not stock_sum.empty:
+        low = stock_sum[stock_sum['Low Stock'] == True]
+        st.metric("Materials Tracked", len(stock_sum))
+        st.metric("Low Stock Alerts", len(low), delta=f"-{len(low)}" if len(low) > 0 else None,
+                  delta_color="inverse")
 
         def _highlight_low(row):
-            colour = 'background-color: #ffe0e0' if row['current_stock'] <= 0 else ''
-            return [colour] * len(row)
+            style = 'background-color: #fff3e0; color: #e65100' if row['Low Stock'] else ''
+            return [style] * len(row)
 
+        st.markdown("**Stock Movement Summary**")
         try:
             st.dataframe(
-                stock.style.apply(_highlight_low, axis=1)
-                           .format({'total_inward': '{:,.0f}', 'total_outward': '{:,.0f}', 'current_stock': '{:,.0f}'}),
+                stock_sum.drop(columns=['Low Stock'])
+                .style.apply(_highlight_low, axis=1),
                 use_container_width=True, height=360
             )
         except Exception:
-            st.dataframe(stock, use_container_width=True, height=360)
+            st.dataframe(stock_sum.drop(columns=['Low Stock'], errors='ignore'),
+                         use_container_width=True, height=360)
+
+        if len(low) > 0:
+            st.warning(f"⚠ {len(low)} material(s) are below 20% of stored inward quantity.")
     else:
-        st.info("Upload an Inward/Outward Register to see stock status.")
+        st.info("Upload Stock Register to see stock position.")
 
-    if st.session_state.purchase_summary is not None and not st.session_state.purchase_summary.empty:
-        st.markdown("**Purchase Summary**")
-        st.dataframe(st.session_state.purchase_summary, use_container_width=True, height=200)
+    if purchase_df is not None and not purchase_df.empty:
+        st.markdown("**Recent Purchases**")
+        show_cols = [c for c in ['date', 'supplier', 'material', 'quantity', 'rate'] if c in purchase_df.columns]
+        with st.expander("View Purchase Data"):
+            st.dataframe(purchase_df[show_cols].rename(columns=str.title),
+                         use_container_width=True, height=260)
 
-# ─── Column 3: Material Outlook ────────────────────────────────
+
+# ── Column 3: Material Outlook ────────────────────────────────
 with col_outlook:
-    st.markdown("### 🔮 Material Outlook")
+    st.markdown('<div class="panel-header">🔮 Material Outlook</div>', unsafe_allow_html=True)
+    st.markdown("")
 
-    if st.session_state.outlook_df is not None and not st.session_state.outlook_df.empty:
-        outlook = st.session_state.outlook_df
-        advisory_col = [c for c in outlook.columns if 'advisory' in c.lower()]
+    if outlook_df is not None and not outlook_df.empty:
+        buy_soon = outlook_df[outlook_df['Advisory'] == 'Buy Soon']
+        prepare  = outlook_df[outlook_df['Advisory'] == 'Prepare']
+        monitor  = outlook_df[outlook_df['Advisory'] == 'Monitor']
 
-        if advisory_col:
-            c1, c2 = st.columns(2)
-            procure = outlook[outlook[advisory_col[0]].str.contains('Prepare', na=False)].shape[0]
-            monitor = outlook[outlook[advisory_col[0]].str.contains('Monitor', na=False)].shape[0]
-            c1.metric("🔴 Procure Soon", procure)
-            c2.metric("🟡 Monitor", monitor)
+        st.metric("Buy Soon 🔴", len(buy_soon))
+        st.metric("Prepare 🟡", len(prepare))
+        st.metric("Monitor 🟢", len(monitor))
 
-        def _highlight_advisory(row):
-            a = [c for c in row.index if 'advisory' in c.lower()]
-            if a and 'Prepare' in str(row[a[0]]):
-                return ['background-color: #fff3cd'] * len(row)
-            elif a and 'Out' in str(row[a[0]]):
-                return ['background-color: #ffe0e0'] * len(row)
-            return [''] * len(row)
+        st.markdown("**Advisory by Material**")
+
+        def _advisory_style(val):
+            if val == 'Buy Soon': return 'color:#c62828; font-weight:bold'
+            if val == 'Prepare':  return 'color:#e65100; font-weight:bold'
+            return 'color:#2e7d32'
 
         try:
-            st.dataframe(outlook.style.apply(_highlight_advisory, axis=1),
-                         use_container_width=True, height=420)
+            st.dataframe(
+                outlook_df.style.applymap(_advisory_style, subset=['Advisory'])
+                .format({'Current Stock': '{:,.1f}', 'Est. Demand': '{:,.1f}'}),
+                use_container_width=True, height=400
+            )
         except Exception:
-            st.dataframe(outlook, use_container_width=True, height=420)
-    elif st.session_state.stock_df is not None:
-        st.info("Upload Sales + Inward/Outward data together to generate Material Outlook.")
+            st.dataframe(outlook_df, use_container_width=True, height=400)
+
+        st.markdown("---")
+        st.caption("**Advisory Logic:**\n- 🔴 Buy Soon = Est. demand > current stock\n- 🟡 Prepare = Demand approaching stock\n- 🟢 Monitor = Stock adequate")
     else:
-        st.info("Upload registers to generate procurement advisory.")
+        st.info("Upload Stock Register to see material advisory.")

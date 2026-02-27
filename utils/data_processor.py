@@ -1,589 +1,459 @@
 """
-Data Processing Engine — Full MVP with Tally PDF Support
-Registers: Sales, Purchase, Inward/Outward
+Inventory Intelligence Engine – Data Processor
+Strict, rule-based, deterministic field mapping engine.
+No AI. No APIs. No PDF. Excel-only.
 """
 
-import io
 import re
 import pandas as pd
 import numpy as np
 
-try:
-    import pdfplumber
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────
+# COLUMN DETECTION ENGINE
+# ─────────────────────────────────────────────────────────────
+
+def _norm(s):
+    """Normalize a column name for matching."""
+    return re.sub(r'[^a-z0-9 ]', ' ', str(s).lower()).strip()
+
+
+def _detect_header_row(raw_df, min_kw, keywords):
+    """Scan first 30 rows, find row with >= min_kw matches."""
+    for i in range(min(30, len(raw_df))):
+        row_vals = [_norm(v) for v in raw_df.iloc[i].tolist()]
+        row_text = ' '.join(row_vals)
+        hits = sum(1 for kw in keywords if kw in row_text)
+        if hits >= min_kw:
+            return i
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
-# SHARED CONSTANTS
+# STRICT COLUMN MAPPING DICTIONARIES
 # ─────────────────────────────────────────────────────────────
 
-SALES_KEYWORDS   = [
-    'voucher', 'date', 'party', 'particulars', 'stock', 'item', 'product',
-    'qty', 'billed', 'quantity', 'gross', 'value', 'amount', 'total',
-    'sgst', 'cgst', 'igst', 'gst', 'gstin', 'uin', 'tax',
-    'sales', 'invoice', 'bill', 'account', 'ref', 'no',
-]
-PURCHASE_KEYWORDS = [
-    'date', 'party', 'supplier', 'vendor', 'material', 'item', 'product',
-    'qty', 'quantity', 'purchase', 'amount', 'value', 'total', 'gross',
-    'sgst', 'cgst', 'igst', 'gst', 'gstin', 'uin', 'invoice', 'bill', 'voucher', 'ref',
-]
-INOUT_KEYWORDS   = [
-    'date', 'material', 'item', 'inward', 'outward', 'receipt', 'issue',
-    'balance', 'stock', 'qty', 'quantity', 'in', 'out', 'closing', 'opening',
-]
-TOTAL_KEYWORDS   = ['total', 'grand total', 'sub total', 'subtotal', 'net total', 'closing', 'opening']
+# DATE: must contain "date", never contain "due" 
+DATE_KEYWORDS     = {'invoice date', 'date', 'bill date', 'voucher date', 'invoice_date', 'bill_date', 'voucher_date'}
+DATE_REJECT       = {'due'}
+
+# CUSTOMER: must contain party/customer/buyer/bill
+CUSTOMER_KEYWORDS = {'party name', 'customer name', 'buyer', 'bill to', 'm/s', 'customer', 'party', 'client', 'consignee'}
+CUSTOMER_MUST_HAVE = {'party', 'customer', 'buyer', 'bill', 'client', 'consignee', 'm/s'}
+
+# PRODUCT: must NOT contain rate/amount/price
+PRODUCT_KEYWORDS  = {'item', 'product', 'description', 'stock item', 'goods', 'item name', 'particulars', 'material', 'stock_item'}
+PRODUCT_REJECT    = {'rate', 'amount', 'price'}
+
+# QUANTITY: allowed keywords, must NOT contain rate/amount/price/value
+QUANTITY_KEYWORDS = {'qty', 'quantity', 'billed qty', 'actual qty', 'units', 'nos', 'billed_qty', 'actual_qty', 'pcs', 'pieces'}
+QUANTITY_REJECT   = {'rate', 'amount', 'price', 'value'}
+
+# RATE: allowed, must NOT contain qty/quantity
+RATE_KEYWORDS     = {'rate', 'price', 'unit rate', 'unit_rate', 'rate/unit'}
+RATE_REJECT       = {'qty', 'quantity'}
+
+# SUPPLIER (purchase bills)
+SUPPLIER_KEYWORDS = {'supplier', 'vendor', 'party name', 'party', 'seller', 'from', 'manufacturer'}
+SUPPLIER_MUST_HAVE = {'supplier', 'vendor', 'party', 'seller', 'from', 'manufacturer'}
+
+# INWARD / OUTWARD
+INWARD_KEYWORDS   = {'inward', 'receipt', 'received', 'in', 'purchase', 'qty in', 'inward qty'}
+OUTWARD_KEYWORDS  = {'outward', 'issue', 'issued', 'out', 'sales', 'qty out', 'dispatch', 'dispatched'}
+BALANCE_KEYWORDS  = {'balance', 'closing', 'current stock', 'stock'}
 
 
-
-# ─────────────────────────────────────────────────────────────
-# SHARED HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def _detect_header_row(df_raw, keywords, min_hits=3):
-    """Scan first 25 rows to find the true table header row index."""
-    best_row, best_score = 0, 0
-    for i in range(min(25, len(df_raw))):
-        row_vals = [str(x).strip().lower() for x in df_raw.iloc[i].values if pd.notna(x)]
-        score = sum(1 for cell in row_vals for kw in keywords if kw in cell)
-        if score > best_score:
-            best_score = score
-            best_row = i
-    return best_row if best_score >= min_hits else 0
+def _map_column(col_name, allowed_keywords, reject_keywords=None):
+    """Return True if col_name matches this field's rules."""
+    c = _norm(col_name)
+    reject_keywords = reject_keywords or set()
+    # Reject if any reject keyword appears
+    for rk in reject_keywords:
+        if rk in c:
+            return False
+    # Accept if any allowed keyword appears
+    for ak in allowed_keywords:
+        if ak in c:
+            return True
+    return False
 
 
-def _normalize_col(name):
-    return (str(name).strip().lower()
-            .replace(" ", "_").replace(".", "_")
-            .replace("/", "_").replace("-", "_")
-            .replace("(", "").replace(")", ""))
-
-
-def _deduplicate_columns(df):
-    """Resolve duplicate column names by keeping the first and tagging the rest for removal."""
-    seen = {}
-    new_cols = []
-    for col in df.columns:
-        if col not in seen:
-            seen[col] = 0
-            new_cols.append(col)
-        else:
-            seen[col] += 1
-            new_cols.append(f"{col}__dup_{seen[col]}")
-    df.columns = new_cols
-    df = df.drop(columns=[c for c in df.columns if '__dup_' in c])
-    return df
-
-
-def _rename_by_map(df, col_map):
-    """Fuzzy-rename columns using a mapping dict {keyword: standard_name}."""
-    rename = {}
-    for col in df.columns:
-        if col in col_map:
-            rename[col] = col_map[col]
-        else:
-            for key, std in col_map.items():
-                if key in col and col not in rename:
-                    rename[col] = std
-                    break
-    return df.rename(columns=rename)
-
-
-def _remove_total_rows(df):
-    mask = df.apply(
-        lambda row: any(kw in str(v).lower() for v in row.values for kw in TOTAL_KEYWORDS),
-        axis=1
-    )
-    return df[~mask]
-
-
-# ─────────────────────────────────────────────────────────────
-# PDF EXTRACTION HELPER
-# ─────────────────────────────────────────────────────────────
-
-def _ingest_pdf_to_dataframe(file_bytes, keywords):
+def _detect_columns(df, field_rules):
     """
-    Robust PDF → DataFrame extractor.
-    Strategy 1: pdfplumber extract_tables() — works great on Tally PDF table exports.
-    Strategy 2: text line parsing — fallback for plaintext-style PDFs.
-    Returns (df, error).
+    Map DataFrame columns to canonical field names.
+    field_rules: dict of {canonical_name: (allowed_kws, reject_kws)}
+    Returns dict {canonical: actual_col_name} and list of unmapped required fields.
     """
-    if not PDF_AVAILABLE:
-        return None, "pdfplumber not installed. Run: pip install pdfplumber"
-    try:
-        all_tables = []
-        all_text_lines = []
-
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            if len(pdf.pages) == 0:
-                return None, "Scanned PDFs not supported. Please upload Excel or text-based Tally export."
-
-            for page in pdf.pages:
-                # Strategy 1: extract structured tables
-                tables = page.extract_tables()
-                for table in tables:
-                    if table and len(table) > 1:
-                        all_tables.append(table)
-
-                # Also collect raw text as fallback
-                t = page.extract_text()
-                if t:
-                    all_text_lines.extend(t.splitlines())
-
-        # ── Strategy 1: Use structured table data ──────────────────
-        if all_tables:
-            combined_rows = []
-            header = None
-
-            def _is_letterhead_row(row):
-                """True if this row looks like a merged letterhead/address cell."""
-                for cell in row:
-                    if '\n' in cell:           # multiline = merged address block
-                        return True
-                    if len(cell) > 80:          # very long single cell = not a table header
-                        return True
-                non_empty = [c for c in row if c.strip()]
-                if len(non_empty) < 2:          # only 1 cell filled = likely address
-                    return True
-                return False
-
-            for table in all_tables:
-                # Clean nulls
-                table = [[str(c).strip().replace('\n', ' ') if c else '' for c in row] for row in table]
-                table = [row for row in table if any(c for c in row)]
-
-                if not table:
-                    continue
-
-                if header is None:
-                    # Scan every row in this table to find the real header
-                    for ri, row in enumerate(table):
-                        if _is_letterhead_row(row):
-                            continue  # skip address/letterhead blocks
-                        row_str = ' '.join(row).lower()
-                        row_score = sum(1 for kw in keywords if kw in row_str)
-                        non_empty_cells = len([c for c in row if c.strip()])
-                        # Accept if keywords match OR if it has 4+ clean cells (column-like)
-                        if row_score >= 1 or non_empty_cells >= 4:
-                            header = row
-                            combined_rows.extend(table[ri + 1:])
-                            break
-                else:
-                    # Already have header — just append data rows, skip letterhead rows
-                    for row in table:
-                        if not _is_letterhead_row(row):
-                            combined_rows.append(row)
-
-            if header and combined_rows:
-                n = len(header)
-                trimmed = [r[:n] + [''] * max(0, n - len(r)) for r in combined_rows]
-                df = pd.DataFrame(trimmed, columns=header)
-                df = df.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
-                if len(df) > 0:
-                    return df, None
-
-
-        # ── Strategy 2: Text line fallback ─────────────────────────
-        lines = [l.strip() for l in all_text_lines if l.strip()]
-        if len(lines) < 5:
-            return None, "Scanned PDFs not supported. Please upload Excel or text-based Tally export."
-
-        # Find best header line (min score = 1 now, much more permissive)
-        best_idx, best_score = 0, 0
-        for i, line in enumerate(lines[:40]):
-            score = sum(1 for kw in keywords if kw in line.lower())
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-        # Brute-force fallback: if still no match, find the first line with 4+ separate tokens
-        # (likely the table header even if none of our keywords matched)
-        if best_score < 1:
-            for i, line in enumerate(lines[:40]):
-                parts = re.split(r'\s{2,}', line)
-                if len(parts) >= 4:
-                    best_idx = i
-                    best_score = 1
-                    break
-
-        if best_score < 1:
-            return None, "Unable to parse PDF structure. Please upload Tally Excel export."
-
-        # Split into columns by 2+ consecutive spaces (Tally alignment)
-        header_line = lines[best_idx]
-        cols = [c.strip() for c in re.split(r'\s{2,}', header_line) if c.strip()]
-        if len(cols) < 2:
-            cols = header_line.split()
-
-        data_rows = []
-        for line in lines[best_idx + 1:]:
-            parts = [c.strip() for c in re.split(r'\s{2,}', line) if c.strip()]
-            if not parts:
+    mapped = {}
+    for canon, (allowed, reject) in field_rules.items():
+        for col in df.columns:
+            if col in mapped.values():
                 continue
-            while len(parts) < len(cols):
-                parts.append('')
-            data_rows.append(parts[:len(cols)])
+            if _map_column(col, allowed, reject):
+                mapped[canon] = col
+                break
+    return mapped
 
-        if not data_rows:
-            return None, "No data rows found in PDF."
 
-        df = pd.DataFrame(data_rows, columns=cols)
-        df = df.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
+# ─────────────────────────────────────────────────────────────
+# FILE READER
+# ─────────────────────────────────────────────────────────────
+
+def _read_excel_smart(file, context_keywords, min_kw=2):
+    """
+    Read an Excel file, detect the header row, and return a clean DataFrame.
+    Returns (df, error_string).
+    """
+    try:
+        raw = pd.read_excel(file, header=None, dtype=str).fillna('')
+        hdr_row = _detect_header_row(raw, min_kw, context_keywords)
+        if hdr_row is None:
+            return None, "Unable to detect structured table header in this file. Ensure it contains column names like Date, Customer, Qty, etc."
+        df = pd.read_excel(file, header=hdr_row, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.replace('', pd.NA)
+        df = df.dropna(how='all').reset_index(drop=True)
         return df, None
-
     except Exception as e:
-        return None, f"PDF read error: {str(e)}"
+        return None, f"File read error: {str(e)}"
 
 
+def _clean_numeric(series):
+    """Strip currency symbols, commas, etc. and convert to float."""
+    return pd.to_numeric(
+        series.astype(str).str.replace(r'[^\d.\-]', '', regex=True),
+        errors='coerce'
+    )
+
+
+def _remove_totals(df, columns):
+    """Remove rows that look like grand totals."""
+    for col in columns:
+        if col in df.columns:
+            mask = df[col].astype(str).str.lower().str.contains(
+                r'\btotal\b|\bgrand\b|\bsubtotal\b', regex=True, na=False
+            )
+            df = df[~mask]
+    return df.reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. SALES REGISTER INGESTION
+# 1. SALES BILLS INGESTION
 # ─────────────────────────────────────────────────────────────
 
-SALES_COL_MAP = {
-    'date': 'date', 'invoice_date': 'date', 'voucher_date': 'date', 'bill_date': 'date',
-    'party': 'customer', 'customer': 'customer', 'customer_name': 'customer',
-    'particulars': 'customer', 'client': 'customer', 'buyer': 'customer', 'party_name': 'customer',
-    'item': 'product', 'item_name': 'product', 'product': 'product', 'stock_item': 'product',
-    'goods': 'product', 'description': 'product',
-    'billed_qty': 'quantity', 'qty': 'quantity', 'quantity': 'quantity',
-    'units': 'quantity', 'nos': 'quantity', 'pcs': 'quantity',
-    # Financial fallbacks
-    'gross_total': 'quantity', 'value': 'quantity', 'amount': 'quantity',
-    'net_amount': 'quantity', 'invoice_value': 'quantity',
+SALES_CONTEXT_KW = ['invoice', 'date', 'party', 'customer', 'item', 'qty', 'quantity',
+                    'product', 'description', 'buyer', 'amount', 'rate']
+
+SALES_FIELD_RULES = {
+    'date':     (DATE_KEYWORDS,     DATE_REJECT),
+    'customer': (CUSTOMER_KEYWORDS, set()),
+    'product':  (PRODUCT_KEYWORDS,  PRODUCT_REJECT),
+    'quantity': (QUANTITY_KEYWORDS, QUANTITY_REJECT),
+    'rate':     (RATE_KEYWORDS,     RATE_REJECT),
 }
 
 
-FINANCIAL_QTY_COLS = {'gross_total', 'grosstotal', 'value', 'net_amount', 'net_total',
-                      'amount', 'invoice_value', 'taxable_value'}
+def ingest_sales_excel(files):
+    """
+    Accept a list of file-like objects (or a single file).
+    Returns (df, errors) — df has columns: date, customer, product, quantity, rate.
+    """
+    if not isinstance(files, list):
+        files = [files]
 
-
-def _clean_sales_df(df, original_cols_before_rename):
-    """Shared sales cleaning logic. Returns (df, error, qty_label)."""
-    df = _remove_total_rows(df)
-
-    required = ['date', 'customer']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        return None, f"Could not find required columns: {missing}. Detected: {list(df.columns)}", None
-
-    # Detect whether quantity is physical units or financial value
-    qty_label = 'Quantity'
-    financial_used = any(c in FINANCIAL_QTY_COLS for c in original_cols_before_rename)
-    if financial_used and 'quantity' not in [c for c in original_cols_before_rename
-                                              if c not in FINANCIAL_QTY_COLS]:
-        qty_label = 'Invoice Value (₹)'
-
-    # Fallback: if quantity still missing, pick first remaining column
-    if 'quantity' not in df.columns:
-        candidates = [c for c in df.columns if c not in ('date', 'customer', 'product')]
-        if candidates:
-            df = df.rename(columns={candidates[0]: 'quantity'})
-            qty_label = 'Invoice Value (₹)'
-        else:
-            return None, "No numeric column found for order value.", None
-
-    keep = [c for c in ['date', 'customer', 'product', 'quantity'] if c in df.columns]
-    df = df[keep]
-
-    df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
-    df['quantity'] = pd.to_numeric(df['quantity'].astype(str).str.replace(r'[^\d.\-]', '', regex=True), errors='coerce')
-
-    df = df.dropna(subset=['date', 'customer', 'quantity'])
-    df = df[df['quantity'] > 0]
-    df['customer'] = df['customer'].astype(str).str.strip()
-    df = df[df['customer'].str.len() > 1]
-    return df.reset_index(drop=True), None, qty_label
-
-
-
-def ingest_sales_excel(file):
-    """Load a Sales Register from Excel. Returns (df, error, qty_label)."""
-    try:
-        raw = pd.read_excel(file, header=None, dtype=str)
-        raw = raw.dropna(how='all').reset_index(drop=True)
-        hdr = _detect_header_row(raw, SALES_KEYWORDS, min_hits=3)
-        df = pd.read_excel(file, header=hdr, dtype=str)
-        orig_cols = [_normalize_col(c) for c in df.columns]
-        df.columns = orig_cols
-        df = _rename_by_map(df, SALES_COL_MAP)
-        df = _deduplicate_columns(df)
-        return _clean_sales_df(df, orig_cols)
-    except Exception as e:
-        return None, str(e), None
-
-
-
-def ingest_sales_pdf(file_bytes):
-    """Load a Sales Register from a text-based Tally PDF. Returns (df, error, qty_label)."""
-    try:
-        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, SALES_KEYWORDS)
+    frames, errors = [], []
+    for f in files:
+        fname = getattr(f, 'name', str(f))
+        df_raw, err = _read_excel_smart(f, SALES_CONTEXT_KW, min_kw=2)
         if err:
-            return None, err, None
-        orig_cols = [_normalize_col(c) for c in df_raw.columns]
-        df_raw.columns = orig_cols
-        df_raw = _rename_by_map(df_raw, SALES_COL_MAP)
-        df_raw = _deduplicate_columns(df_raw)
-        return _clean_sales_df(df_raw, orig_cols)
-    except Exception as e:
-        return None, str(e), None
+            errors.append(f"{fname}: {err}")
+            continue
 
+        mapped = _detect_columns(df_raw, SALES_FIELD_RULES)
 
+        required = ['date', 'customer', 'quantity']
+        missing = [r for r in required if r not in mapped]
+        if missing:
+            col_list = ', '.join(f'"{m}"' for m in missing)
+            errors.append(f"{fname}: Required column(s) not detected: {col_list}. "
+                          f"Check column names match: Date/Customer/Qty.")
+            continue
 
+        # Build clean frame
+        rename = {v: k for k, v in mapped.items()}
+        subset = df_raw[[v for v in mapped.values()]].rename(columns=rename)
+        if 'product' not in subset.columns:
+            subset['product'] = 'UNSPECIFIED'
+        if 'rate' not in subset.columns:
+            subset['rate'] = pd.NA
 
-# ─────────────────────────────────────────────────────────────
-# 2. ANCHOR CUSTOMER IDENTIFICATION & PREDICTION
-# ─────────────────────────────────────────────────────────────
+        subset = _remove_totals(subset, ['customer', 'product'])
+        subset['date']     = pd.to_datetime(subset['date'], errors='coerce', dayfirst=True)
+        subset['quantity'] = _clean_numeric(subset['quantity'])
+        subset['rate']     = _clean_numeric(subset['rate']) if 'rate' in subset.columns else pd.NA
 
-def get_anchor_customers(df, top_n=5):
-    """Return top N customers by total quantity. Returns (df, error)."""
-    try:
-        agg = df.groupby('customer').agg(
-            total_quantity=('quantity', 'sum'),
-            order_count=('quantity', 'count')
-        ).reset_index().sort_values('total_quantity', ascending=False).reset_index(drop=True)
-        total = agg['total_quantity'].sum()
-        agg['contribution_pct'] = (agg['total_quantity'] / total * 100).round(2) if total > 0 else 0.0
-        return agg.head(top_n), None
-    except Exception as e:
-        return pd.DataFrame(), str(e)
+        subset = subset.dropna(subset=['date', 'customer', 'quantity'])
+        subset = subset[subset['quantity'] > 0]
+        subset['customer'] = subset['customer'].astype(str).str.strip().str.title()
+        subset['product']  = subset['product'].astype(str).str.strip()
+        subset             = subset[subset['customer'].str.len() > 1]
+        subset['source']   = fname
+        frames.append(subset)
 
-
-def predict_reorder(df, anchor_customers):
-    """Predict reorder window per anchor customer (min 3 orders). Returns (df, error)."""
-    try:
-        results = []
-        for _, row in anchor_customers.iterrows():
-            cust = row['customer']
-            orders = df[df['customer'] == cust].sort_values('date').drop_duplicates('date')
-            if len(orders) < 2:
-                continue
-            intervals = orders['date'].diff().dt.days.dropna()
-            mu = intervals.mean()
-            sigma = intervals.std()
-            if mu <= 0 or pd.isna(mu):
-                continue
-            last_order = orders['date'].max()
-            predicted = last_order + pd.Timedelta(days=mu)
-            half_sig = (sigma * 0.5) if not pd.isna(sigma) else 0
-            confidence = max(0.0, round(100 - (sigma / mu * 100), 1)) if not pd.isna(sigma) else 50.0
-            results.append({
-                'Customer': cust,
-                'Last Order': last_order.strftime('%d %b %Y'),
-                'Avg Interval (Days)': round(mu, 1),
-                'Predicted Next Order': predicted.strftime('%d %b %Y'),
-                'Window': f"{(predicted - pd.Timedelta(days=half_sig)).strftime('%d %b')} – {(predicted + pd.Timedelta(days=half_sig)).strftime('%d %b %Y')}",
-                'Confidence %': confidence,
-            })
-        return pd.DataFrame(results), None
-    except Exception as e:
-        return pd.DataFrame(), str(e)
+    if not frames:
+        return pd.DataFrame(), errors
+    return pd.concat(frames, ignore_index=True), errors
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. INWARD / OUTWARD REGISTER
+# 2. PURCHASE BILLS INGESTION
 # ─────────────────────────────────────────────────────────────
 
-INOUT_COL_MAP = {
-    'date': 'date', 'invoice_date': 'date',
-    'material': 'material', 'item': 'material', 'item_name': 'material',
-    'product': 'material', 'stock_item': 'material', 'goods': 'material',
-    'inward': 'inward', 'receipt': 'inward', 'received': 'inward', 'in': 'inward',
-    'purchase': 'inward', 'qty_in': 'inward',
-    'outward': 'outward', 'issue': 'outward', 'issued': 'outward', 'out': 'outward',
-    'sales': 'outward', 'qty_out': 'outward', 'dispatch': 'outward',
-    'balance': 'balance', 'current_stock': 'balance', 'closing': 'balance',
+PURCHASE_CONTEXT_KW = ['supplier', 'vendor', 'date', 'material', 'item', 'qty', 'quantity', 'rate', 'purchase']
+
+PURCHASE_FIELD_RULES = {
+    'date':     (DATE_KEYWORDS,     DATE_REJECT),
+    'supplier': (SUPPLIER_KEYWORDS, set()),
+    'material': (PRODUCT_KEYWORDS,  PRODUCT_REJECT),
+    'quantity': (QUANTITY_KEYWORDS, QUANTITY_REJECT),
+    'rate':     (RATE_KEYWORDS,     RATE_REJECT),
 }
 
 
-def _clean_inout_df(df):
-    df = _remove_total_rows(df)
-    if 'material' not in df.columns:
-        candidates = [c for c in df.columns if c not in ('date', 'inward', 'outward', 'balance')]
-        if candidates:
-            df = df.rename(columns={candidates[0]: 'material'})
-    if 'inward' not in df.columns:
-        df['inward'] = 0
-    if 'outward' not in df.columns:
-        df['outward'] = 0
-    for col in ['inward', 'outward']:
-        df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[^\d.\-]', '', regex=True), errors='coerce').fillna(0)
-    df['material'] = df['material'].astype(str).str.strip()
-    df = df[df['material'].str.len() > 1]
-    return df.reset_index(drop=True), None
+def ingest_purchase_excel(files):
+    """
+    Accept a list of file-like objects.
+    Returns (df, errors) — df has columns: date, supplier, material, quantity, rate.
+    """
+    if not isinstance(files, list):
+        files = [files]
 
-
-def ingest_inout_excel(file):
-    """Load Inward/Outward register from Excel."""
-    try:
-        raw = pd.read_excel(file, header=None, dtype=str).dropna(how='all').reset_index(drop=True)
-        hdr = _detect_header_row(raw, INOUT_KEYWORDS, min_hits=2)
-        df = pd.read_excel(file, header=hdr, dtype=str)
-        df.columns = [_normalize_col(c) for c in df.columns]
-        df = _rename_by_map(df, INOUT_COL_MAP)
-        df = _deduplicate_columns(df)
-        return _clean_inout_df(df)
-    except Exception as e:
-        return None, str(e)
-
-
-def ingest_inout_pdf(file_bytes):
-    """Load Inward/Outward register from PDF."""
-    try:
-        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, INOUT_KEYWORDS)
+    frames, errors = [], []
+    for f in files:
+        fname = getattr(f, 'name', str(f))
+        df_raw, err = _read_excel_smart(f, PURCHASE_CONTEXT_KW, min_kw=2)
         if err:
-            return None, err
-        df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
-        df_raw = _rename_by_map(df_raw, INOUT_COL_MAP)
-        df_raw = _deduplicate_columns(df_raw)
-        return _clean_inout_df(df_raw)
-    except Exception as e:
-        return None, str(e)
+            errors.append(f"{fname}: {err}")
+            continue
+
+        mapped = _detect_columns(df_raw, PURCHASE_FIELD_RULES)
+
+        required = ['date', 'quantity']
+        missing = [r for r in required if r not in mapped]
+        if missing:
+            errors.append(f"{fname}: Required column(s) not detected: {', '.join(missing)}.")
+            continue
+
+        rename = {v: k for k, v in mapped.items()}
+        subset = df_raw[[v for v in mapped.values()]].rename(columns=rename)
+        if 'supplier' not in subset.columns:
+            subset['supplier'] = 'UNSPECIFIED'
+        if 'material' not in subset.columns:
+            subset['material'] = 'UNSPECIFIED'
+        if 'rate' not in subset.columns:
+            subset['rate'] = pd.NA
+
+        subset = _remove_totals(subset, ['supplier', 'material'])
+        subset['date']     = pd.to_datetime(subset['date'], errors='coerce', dayfirst=True)
+        subset['quantity'] = _clean_numeric(subset['quantity'])
+        subset['rate']     = _clean_numeric(subset['rate'])
+
+        subset = subset.dropna(subset=['date', 'quantity'])
+        subset = subset[subset['quantity'] > 0]
+        subset['source'] = fname
+        frames.append(subset)
+
+    if not frames:
+        return pd.DataFrame(), errors
+    return pd.concat(frames, ignore_index=True), errors
 
 
+# ─────────────────────────────────────────────────────────────
+# 3. STOCK REGISTER INGESTION
+# ─────────────────────────────────────────────────────────────
 
-def compute_stock(inout_df):
-    """Compute current stock per material."""
+STOCK_CONTEXT_KW = ['material', 'item', 'inward', 'outward', 'stock', 'qty', 'balance', 'in', 'out']
+
+STOCK_FIELD_RULES = {
+    'material': (PRODUCT_KEYWORDS | {'material'}, PRODUCT_REJECT),
+    'inward':   (INWARD_KEYWORDS,  set()),
+    'outward':  (OUTWARD_KEYWORDS, set()),
+    'balance':  (BALANCE_KEYWORDS, set()),
+}
+
+
+def ingest_stock_excel(file):
+    """
+    Accept a single stock register Excel file.
+    Returns (df, error) — df has columns: material, inward, outward.
+    """
+    fname = getattr(file, 'name', str(file))
+    df_raw, err = _read_excel_smart(file, STOCK_CONTEXT_KW, min_kw=2)
+    if err:
+        return pd.DataFrame(), err
+
+    mapped = _detect_columns(df_raw, STOCK_FIELD_RULES)
+
+    if 'material' not in mapped:
+        return pd.DataFrame(), f"{fname}: Material/Item column not detected."
+
+    rename = {v: k for k, v in mapped.items()}
+    subset = df_raw[[v for v in mapped.values()]].rename(columns=rename)
+
+    if 'inward' not in subset.columns:
+        subset['inward'] = 0
+    if 'outward' not in subset.columns:
+        subset['outward'] = 0
+
+    subset = _remove_totals(subset, ['material'])
+    subset['inward']  = _clean_numeric(subset['inward']).fillna(0)
+    subset['outward'] = _clean_numeric(subset['outward']).fillna(0)
+    subset['material'] = subset['material'].astype(str).str.strip()
+    subset = subset[subset['material'].str.len() > 1]
+    return subset.reset_index(drop=True), None
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. ANALYTICS ENGINE
+# ─────────────────────────────────────────────────────────────
+
+def get_anchor_customers(sales_df, top_n=5):
+    """Top N customers by total quantity. Returns (df, error)."""
     try:
-        agg = inout_df.groupby('material').agg(
-            total_inward=('inward', 'sum'),
-            total_outward=('outward', 'sum')
-        ).reset_index()
-        agg['current_stock'] = agg['total_inward'] - agg['total_outward']
-        agg = agg.sort_values('current_stock', ascending=True).reset_index(drop=True)
+        if sales_df is None or sales_df.empty:
+            return pd.DataFrame(), "No sales data."
+        agg = (sales_df.groupby('customer')
+               .agg(total_qty=('quantity', 'sum'),
+                    invoices=('quantity', 'count'))
+               .reset_index()
+               .sort_values('total_qty', ascending=False)
+               .head(top_n)
+               .reset_index(drop=True))
+        total = agg['total_qty'].sum()
+        agg['share_pct'] = ((agg['total_qty'] / total) * 100).round(1) if total > 0 else 0.0
+        agg.columns = ['Customer', 'Total Qty', 'Invoices', 'Share %']
         return agg, None
     except Exception as e:
         return pd.DataFrame(), str(e)
 
 
-# ─────────────────────────────────────────────────────────────
-# 4. PURCHASE REGISTER
-# ─────────────────────────────────────────────────────────────
-
-PURCHASE_COL_MAP = {
-    'date': 'date', 'invoice_date': 'date', 'purchase_date': 'date',
-    'supplier': 'supplier', 'party': 'supplier', 'vendor': 'supplier',
-    'material': 'material', 'item': 'material', 'item_name': 'material',
-    'product': 'material', 'stock_item': 'material', 'goods': 'material',
-    'qty': 'quantity', 'quantity': 'quantity', 'units': 'quantity',
-    'nos': 'quantity', 'pcs': 'quantity', 'amount': 'quantity',
-    'value': 'quantity', 'gross_total': 'quantity',
-}
-
-
-def _clean_purchase_df(df):
-    df = _remove_total_rows(df)
-    if 'material' not in df.columns:
-        candidates = [c for c in df.columns if c not in ('date', 'supplier', 'quantity')]
-        if candidates:
-            df = df.rename(columns={candidates[0]: 'material'})
-    if 'quantity' not in df.columns:
-        candidates = [c for c in df.columns if c not in ('date', 'supplier', 'material')]
-        if candidates:
-            df = df.rename(columns={candidates[0]: 'quantity'})
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
-    if 'quantity' in df.columns:
-        df['quantity'] = pd.to_numeric(df['quantity'].astype(str).str.replace(r'[^\d.\-]', '', regex=True), errors='coerce').fillna(0)
-    keep = [c for c in ['date', 'supplier', 'material', 'quantity'] if c in df.columns]
-    df = df[keep]
-    df['material'] = df['material'].astype(str).str.strip()
-    df = df[df['material'].str.len() > 1]
-    return df.reset_index(drop=True), None
-
-
-def ingest_purchase_excel(file):
-    """Load Purchase register from Excel."""
+def predict_reorder(sales_df, anchor_df):
+    """
+    For each anchor customer, compute mean/sigma interval and predict next order.
+    Returns (df, error).
+    """
     try:
-        raw = pd.read_excel(file, header=None, dtype=str).dropna(how='all').reset_index(drop=True)
-        hdr = _detect_header_row(raw, PURCHASE_KEYWORDS, min_hits=2)
-        df = pd.read_excel(file, header=hdr, dtype=str)
-        df.columns = [_normalize_col(c) for c in df.columns]
-        df = _rename_by_map(df, PURCHASE_COL_MAP)
-        df = _deduplicate_columns(df)
-        return _clean_purchase_df(df)
-    except Exception as e:
-        return None, str(e)
+        if sales_df is None or sales_df.empty or anchor_df is None or anchor_df.empty:
+            return pd.DataFrame(), "No data."
+        results = []
+        for _, row in anchor_df.iterrows():
+            cust = row['Customer']
+            orders = (sales_df[sales_df['customer'] == cust]
+                      .sort_values('date')
+                      .drop_duplicates('date'))
+            if len(orders) < 2:
+                continue
+            intervals = orders['date'].diff().dt.days.dropna()
+            mu    = intervals.mean()
+            sigma = intervals.std() if len(intervals) > 1 else 0.0
+            if mu <= 0 or pd.isna(mu):
+                continue
+            last_order = orders['date'].max()
+            predicted  = last_order + pd.Timedelta(days=round(mu))
+            half_sig   = (sigma * 0.5) if not pd.isna(sigma) else 0
 
+            if mu == 0:
+                confidence = 0.0
+            else:
+                confidence = max(0.0, round(100 - (sigma / mu * 100), 1)) if not pd.isna(sigma) else 50.0
 
-def ingest_purchase_pdf(file_bytes):
-    """Load Purchase register from PDF."""
-    try:
-        df_raw, err = _ingest_pdf_to_dataframe(file_bytes, PURCHASE_KEYWORDS)
-        if err:
-            return None, err
-        df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
-        df_raw = _rename_by_map(df_raw, PURCHASE_COL_MAP)
-        df_raw = _deduplicate_columns(df_raw)
-        return _clean_purchase_df(df_raw)
-    except Exception as e:
-        return None, str(e)
+            early = predicted - pd.Timedelta(days=round(half_sig))
+            late  = predicted + pd.Timedelta(days=round(half_sig))
 
-
-
-def compute_purchase_summary(purchase_df):
-    """Summarise total purchase and recent 60-day purchase per material."""
-    try:
-        total_agg = purchase_df.groupby('material')['quantity'].sum().reset_index()
-        total_agg.columns = ['Material', 'Total Purchased']
-
-        if 'date' in purchase_df.columns:
-            cutoff = purchase_df['date'].max() - pd.Timedelta(days=60)
-            recent = purchase_df[purchase_df['date'] >= cutoff]
-            recent_agg = recent.groupby('material')['quantity'].sum().reset_index()
-            recent_agg.columns = ['Material', 'Last 60 Days']
-            result = pd.merge(total_agg, recent_agg, on='Material', how='left').fillna(0)
-        else:
-            result = total_agg
-
-        return result.sort_values('Total Purchased', ascending=False).reset_index(drop=True), None
+            results.append({
+                'Customer':             cust,
+                'Last Order':           last_order.strftime('%d %b %Y'),
+                'Avg Interval (Days)':  round(mu, 1),
+                'Predicted Next Order': predicted.strftime('%d %b %Y'),
+                'Window':               f"{early.strftime('%d %b')} – {late.strftime('%d %b %Y')}",
+                'Confidence %':         confidence,
+            })
+        if not results:
+            return pd.DataFrame(), "Not enough order history (need ≥2 dates per customer)."
+        return pd.DataFrame(results), None
     except Exception as e:
         return pd.DataFrame(), str(e)
 
 
-# ─────────────────────────────────────────────────────────────
-# 5. MATERIAL OUTLOOK
-# ─────────────────────────────────────────────────────────────
+def compute_stock(stock_df):
+    """
+    Aggregate material movements.
+    Returns (df, error) with columns: Material, Total Inward, Total Outward, Current Stock.
+    """
+    try:
+        if stock_df is None or stock_df.empty:
+            return pd.DataFrame(), "No stock data."
+        agg = (stock_df.groupby('material')
+               .agg(total_inward=('inward', 'sum'),
+                    total_outward=('outward', 'sum'))
+               .reset_index())
+        agg['current_stock'] = agg['total_inward'] - agg['total_outward']
+        # Highlight low stock: below 20% of total inward
+        agg['low_stock'] = agg['current_stock'] < (agg['total_inward'] * 0.2)
+        agg.columns = ['Material', 'Total Inward', 'Total Outward', 'Current Stock', 'Low Stock']
+        return agg.sort_values('Current Stock').reset_index(drop=True), None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
 
 def material_outlook(stock_df, predictions_df, sales_df):
     """
     Compare predicted demand vs current stock.
-    Uses anchor customer avg order qty as predicted demand.
-    Rule-based advisory: if predicted demand > current stock → Prepare/Buy Soon.
+    Returns (df, error).
     """
     try:
         if stock_df is None or stock_df.empty:
-            return pd.DataFrame(), "No stock data available."
+            return pd.DataFrame(), "No stock data for outlook."
 
-        outlook = stock_df[['material', 'current_stock']].copy()
+        stock_agg, _ = compute_stock(stock_df)
+        if stock_agg is None or stock_agg.empty:
+            return pd.DataFrame(), "No stock after aggregation."
 
-        # Estimate predicted demand: avg daily quantity from sales × avg reorder interval
-        predicted_demand_total = 0
-        if predictions_df is not None and not predictions_df.empty:
-            predicted_demand_total = predictions_df['Avg Interval (Days)'].mean()
+        # Get avg monthly outward per material
+        rows = []
+        for _, srow in stock_agg.iterrows():
+            mat   = srow['Material']
+            c_stk = srow['Current Stock']
 
-        if sales_df is not None and not sales_df.empty and 'product' in sales_df.columns:
-            product_demand = sales_df.groupby('product')['quantity'].mean().reset_index()
-            product_demand.columns = ['material', 'avg_order_qty']
-            outlook = pd.merge(outlook, product_demand, on='material', how='left').fillna(0)
-            outlook['projected_demand'] = outlook['avg_order_qty'] * (predicted_demand_total if predicted_demand_total > 0 else 1)
-        else:
-            outlook['projected_demand'] = 0
+            # Estimate demand from sales data product column (fuzzy match on material name)
+            demand_est = 0.0
+            if sales_df is not None and not sales_df.empty and 'product' in sales_df.columns:
+                mask = sales_df['product'].str.lower().str.contains(
+                    re.escape(mat.lower()[:6]), na=False
+                )
+                demand_est = float(sales_df.loc[mask, 'quantity'].sum())
 
-        def advisory(row):
-            if row['projected_demand'] > row['current_stock']:
-                return '🔴 Prepare / Buy Soon'
-            elif row['current_stock'] <= 0:
-                return '🔴 Stock Out'
+            if predictions_df is not None and not predictions_df.empty:
+                # Simple: if any prediction is within 30 days, treat demand as urgent
+                status = 'Monitor'
+                if demand_est > c_stk and c_stk >= 0:
+                    status = 'Buy Soon'
+                elif demand_est > c_stk * 0.7:
+                    status = 'Prepare'
             else:
-                return '🟡 Monitor'
+                if c_stk <= 0:
+                    status = 'Buy Soon'
+                elif srow['Low Stock']:
+                    status = 'Prepare'
+                else:
+                    status = 'Monitor'
 
-        outlook['Advisory'] = outlook.apply(advisory, axis=1)
-        outlook = outlook.sort_values('current_stock', ascending=True).reset_index(drop=True)
-        outlook.columns = [c.replace('_', ' ').title() for c in outlook.columns]
-        return outlook, None
+            rows.append({
+                'Material':       mat,
+                'Current Stock':  round(c_stk, 1),
+                'Est. Demand':    round(demand_est, 1),
+                'Advisory':       status,
+            })
+        return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), str(e)
