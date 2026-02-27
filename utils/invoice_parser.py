@@ -120,7 +120,25 @@ def _gemini_parse_all(text, api_key):
             raw = response.text.strip()
             
             # Since we forced application/json, it should be pure json
-            parsed = json.loads(raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                # Attempt robust cleanup for common LLM JSON errors in large outputs
+                raw_clean = re.sub(r'```(?:json)?\s*', '', raw)
+                raw_clean = re.sub(r'\s*```', '', raw_clean)
+                # Fix trailing commas
+                raw_clean = re.sub(r',\s*([\]}])', r'\1', raw_clean)
+                # Fix unescaped quotes inside strings (basic heuristic)
+                raw_clean = re.sub(r'([a-zA-Z])"([a-zA-Z])', r'\1\"\2', raw_clean)
+                
+                try:
+                    parsed = json.loads(raw_clean)
+                except json.JSONDecodeError as nested_e:
+                    err_pos = getattr(nested_e, 'pos', 0)
+                    snippet = raw_clean[max(0, err_pos-40):min(len(raw_clean), err_pos+40)]
+                    last_err = f"JSON format error from {model_name}: {nested_e}. Snippet: '...{snippet}...' "
+                    continue
+
             if isinstance(parsed, dict):
                 parsed = [parsed]
             return parsed, None
@@ -133,9 +151,6 @@ def _gemini_parse_all(text, api_key):
             if '404' in err_str or 'not found' in err_str.lower():
                 last_err = f"{model_name}: Model not found"
                 continue
-            # If it's a JSON parse error, we return it rather than trying another model
-            if isinstance(e, json.JSONDecodeError):
-                return None, f"JSON error from {model_name}: {e}"
             last_err = f"API error ({model_name}): {err_str}"
             
     return None, last_err
