@@ -108,6 +108,7 @@ with tab_ingest:
     with col_up3:
         st.markdown("### 📋 Bill of Materials")
         st.caption("Product to raw material mapping")
+        st.caption("*Required Columns: Product Name, Copper Weight, Lamination Weight*")
         bom_file = st.file_uploader("BOM File", type=["xlsx", "xls"], key="bom_up")
         
         st.markdown("<br>", unsafe_allow_html=True)
@@ -226,26 +227,13 @@ with tab_dash:
     total_materials  = stock_df['material'].nunique() if stock_df is not None and not stock_df.empty else 0
     pred_count       = len(predictions) if predictions is not None and not predictions.empty else 0
 
-    st.markdown(f"""
-    <div class="kpi-row">
-      <div class="kpi-card" style="border-left: 4px solid #0B3D91;">
-        <div class="kpi-label">Active Customers</div>
-        <div class="kpi-value">{total_customers}</div>
-      </div>
-      <div class="kpi-card" style="border-left: 4px solid #F4B400;">
-        <div class="kpi-label">Anchor Clients</div>
-        <div class="kpi-value">{anchor_count}</div>
-      </div>
-      <div class="kpi-card" style="border-left: 4px solid #5A6772;">
-        <div class="kpi-label">SKUs Tracked</div>
-        <div class="kpi-value">{total_materials}</div>
-      </div>
-      <div class="kpi-card" style="border-left: 4px solid #2e7d32;">
-        <div class="kpi-label">Expected Reorders</div>
-        <div class="kpi-value">{pred_count}</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Replace raw HTML with native UI columns for proper margins
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Active Customers", total_customers)
+    k2.metric("Anchor Clients", anchor_count)
+    k3.metric("SKUs Tracked", total_materials)
+    k4.metric("Expected Reorders", pred_count)
+    st.markdown("---")
     
     
     # -- DASH SECTION 1 --
@@ -324,16 +312,12 @@ with tab_dash:
         else:
             st.info("Awaiting combined stock and sales data.")
 
-
-# ─────────────────────────────────────────────────────────────
-# TAB 2: BOM & PROCUREMENT
-# ─────────────────────────────────────────────────────────────
-with tab_bom:
+    # -- DASH SECTION 4: BOM ENGINE --
+    st.markdown('<br><div class="panel-header">🧾 BOM-Driven Procurement Engine</div>', unsafe_allow_html=True)
+    st.markdown("Automated raw material demand planning driven by predicted customer orders.")
+    
     requirements_df = st.session_state.get('requirements_df')
     bom_df          = st.session_state.get('bom_df')
-
-    st.markdown('<div class="panel-header">🧾 BOM-Driven Procurement Engine</div>', unsafe_allow_html=True)
-    st.markdown("Automated raw material demand planning driven by predicted customer orders.")
 
     if requirements_df is not None and not requirements_df.empty:
         col_kpi1, col_kpi2 = st.columns(2)
@@ -366,14 +350,24 @@ with tab_bom:
             st.dataframe(requirements_df, use_container_width=True, height=500)
 
     elif bom_df is not None and not bom_df.empty:
-        st.info("BOM loaded. Upload Sales Bills to generate reorder predictions and compute material requirements.")
-        st.markdown("**Raw Bill of Materials Mapping**")
-        st.dataframe(
-            bom_df.assign(**{"SR. NO.": range(1, len(bom_df)+1)}).set_index("SR. NO."),
-            use_container_width=True, height=400
-        )
+        st.info("Upload Sales Bills to generate reorder predictions and compute material requirements.")
     else:
         st.info("Upload your **BOM file** in the Data Ingestion tab to activate Procurement Alerts.")
+
+# ─────────────────────────────────────────────────────────────
+# TAB 2: BOM RAW MAPPING
+# ─────────────────────────────────────────────────────────────
+with tab_bom:
+    st.markdown('<div class="panel-header">📋 Uploaded Bill of Materials</div>', unsafe_allow_html=True)
+    
+    _bom = st.session_state.get('bom_df')
+    if _bom is not None and not _bom.empty:
+        st.dataframe(
+            _bom.assign(**{"SR. NO.": range(1, len(_bom)+1)}).set_index("SR. NO."),
+            use_container_width=True, height=600
+        )
+    else:
+        st.info("Upload your **BOM file** in the Data Ingestion tab to view your raw materials mapping here.")
 
 # ─────────────────────────────────────────────────────────────
 # TAB 3: COMMODITY INSIGHTS

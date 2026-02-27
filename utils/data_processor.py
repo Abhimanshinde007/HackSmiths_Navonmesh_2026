@@ -1143,7 +1143,12 @@ def material_outlook(stock_df, predictions_df, sales_df):
                 'Est. Demand':    round(demand_est, 1),
                 'Advisory':       status,
             })
-        return pd.DataFrame(rows), None
+        out_df = pd.DataFrame(rows)
+        if not out_df.empty:
+            severity_map = {'Buy Soon': 1, 'Prepare': 2, 'Monitor': 3}
+            out_df['Severity'] = out_df['Advisory'].map(severity_map)
+            out_df = out_df.sort_values(by=['Severity', 'Est. Demand'], ascending=[True, False]).drop(columns=['Severity'])
+        return out_df, None
     except Exception as e:
         return pd.DataFrame(), str(e)# -----------------------------------------------------------------
 # 4. BILL OF MATERIALS (BOM) INGESTION & REQUIREMENTS ENGINE
