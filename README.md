@@ -15,13 +15,19 @@ Manufacturing MSMEs rely heavily on Excel-based sales, purchase, and stock recor
 
 ## 🏗️ System Architecture
 
-- **Frontend**: React + Tailwind CSS
-- **Backend**: FastAPI (Python)
-- **Data Processing**: Pandas, NumPy
-- **Database**: PostgreSQL
+- **Core Language**: Python 3.10+
+- **Application Framework**: Streamlit
+- **Data Processing**: pandas, numpy, openpyxl
+- **Data Handling**: In-memory processing (Streamlit session state)
 
 **Workflow**:
-`Excel Upload` → `Data Cleaning` → `Demand Modeling` → `Prediction Engine` → `Procurement Insight Dashboard`
+`User Uploads Excel` → `Pandas Cleans & Structures Data` → `Anchor Customer Prediction Logic` → `BOM Mapping` → `Raw Material Forecast Output` → `Dashboard Display`
+
+## 🎨 UI Design Approach
+
+- Streamlit wide layout with custom CSS injection
+- **Industrial Color Palette**: Deep Blue (#0B3D91), Amber (#F4B400), Steel Grey (#5A6772), Clean white background
+- Professional industrial dashboard feel
 
 ## ⚙️ Setup Instructions
 

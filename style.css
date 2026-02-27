@@ -1,0 +1,56 @@
+/* Custom CSS Injection for Streamlit App
+   Palette:
+   Deep Blue: #0B3D91
+   Amber: #F4B400
+   Steel Grey: #5A6772
+   Clean White: #FFFFFF
+*/
+
+/* Main window background */
+.stApp {
+    background-color: #FFFFFF;
+}
+
+/* Sidebar background */
+[data-testid="stSidebar"] {
+    background-color: #eef1f6;
+    border-right: 2px solid #5A6772;
+}
+
+/* Typography styles */
+h1, h2, h3, h4, hr {
+    color: #0B3D91 !important;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Primary Button Styling */
+.stButton>button {
+    background-color: #0B3D91;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 4px;
+    font-weight: bold;
+    transition: all 0.3s ease;
+}
+
+.stButton>button:hover {
+    background-color: #F4B400; /* Amber hover effect */
+    color: #0B3D91;
+}
+
+/* Metrics Card Styling */
+[data-testid="stMetricValue"] {
+    color: #F4B400 !important;
+    font-weight: bold;
+}
+
+[data-testid="stMetricLabel"] {
+    color: #5A6772 !important;
+    font-size: 1.1em;
+}
+
+/* Dataframe Styling overlays */
+[data-testid="stDataFrame"] {
+    border: 1px solid #5A6772;
+    border-radius: 4px;
+}
