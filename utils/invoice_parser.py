@@ -86,29 +86,47 @@ Invoice text:
 """
 
 
+
+# Models tried in order — smallest free-tier first
+GEMINI_MODELS = [
+    'gemini-1.5-flash-8b',   # free tier: 15 RPM
+    'gemini-1.5-flash',       # free tier: 15 RPM
+    'gemini-2.0-flash-lite',  # free tier if available
+    'gemini-2.0-flash',       # paid tier
+]
+
+
 def _gemini_parse_page(page_text, api_key):
-    """Parse one invoice page via Gemini. Returns (dict, error)."""
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=GEMINI_PROMPT + page_text[:4000],
-            config=genai_types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=512,
+    """Parse one invoice page via Gemini, trying models in fallback order."""
+    client = genai.Client(api_key=api_key)
+    last_err = "No model succeeded"
+
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=GEMINI_PROMPT + page_text[:4000],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    max_output_tokens=512,
+                )
             )
-        )
-        raw = response.text.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-        return json.loads(raw), None
-    except json.JSONDecodeError as e:
-        return None, f"JSON error: {e}"
-    except Exception as e:
-        err = str(e)
-        if '429' in err:
-            return None, "RATE_LIMIT"
-        return None, f"API error: {err}"
+            raw = response.text.strip()
+            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+            raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
+            return json.loads(raw), None
+        except json.JSONDecodeError as e:
+            return None, f"JSON error: {e}"
+        except Exception as e:
+            err = str(e)
+            if '429' in err or 'quota' in err.lower() or 'RATE_LIMIT' in err:
+                last_err = f"{model_name}: quota exceeded"
+                continue  # try next model
+            return None, f"API error ({model_name}): {err}"
+
+    return None, f"RATE_LIMIT"  # all models exhausted
+
+
 
 
 
