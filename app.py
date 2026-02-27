@@ -234,7 +234,7 @@ with col_sales:
             except Exception:
                 st.dataframe(pred, use_container_width=True, height=250)
         else:
-            st.info("Predictions require ≥ 3 orders per customer.")
+            st.info("Predictions require ≥ 2 orders per customer.")
 
         # Show raw invoice data in expander
         if 'invoice_no' in df.columns:

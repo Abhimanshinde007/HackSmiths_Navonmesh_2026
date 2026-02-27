@@ -359,7 +359,7 @@ def predict_reorder(df, anchor_customers):
         for _, row in anchor_customers.iterrows():
             cust = row['customer']
             orders = df[df['customer'] == cust].sort_values('date').drop_duplicates('date')
-            if len(orders) < 3:
+            if len(orders) < 2:
                 continue
             intervals = orders['date'].diff().dt.days.dropna()
             mu = intervals.mean()
