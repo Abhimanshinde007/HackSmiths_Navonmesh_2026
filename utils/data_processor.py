@@ -19,10 +19,23 @@ except ImportError:
 # SHARED CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-SALES_KEYWORDS   = ['voucher', 'date', 'party', 'stock', 'item', 'product', 'qty', 'billed', 'quantity', 'gross', 'value']
-PURCHASE_KEYWORDS = ['date', 'party', 'supplier', 'material', 'item', 'product', 'qty', 'quantity', 'purchase', 'amount']
-INOUT_KEYWORDS   = ['date', 'material', 'item', 'inward', 'outward', 'receipt', 'issue', 'balance', 'stock']
+SALES_KEYWORDS   = [
+    'voucher', 'date', 'party', 'particulars', 'stock', 'item', 'product',
+    'qty', 'billed', 'quantity', 'gross', 'value', 'amount', 'total',
+    'sgst', 'cgst', 'igst', 'gst', 'gstin', 'uin', 'tax',
+    'sales', 'invoice', 'bill', 'account', 'ref', 'no',
+]
+PURCHASE_KEYWORDS = [
+    'date', 'party', 'supplier', 'vendor', 'material', 'item', 'product',
+    'qty', 'quantity', 'purchase', 'amount', 'value', 'total', 'gross',
+    'sgst', 'cgst', 'igst', 'gst', 'gstin', 'uin', 'invoice', 'bill', 'voucher', 'ref',
+]
+INOUT_KEYWORDS   = [
+    'date', 'material', 'item', 'inward', 'outward', 'receipt', 'issue',
+    'balance', 'stock', 'qty', 'quantity', 'in', 'out', 'closing', 'opening',
+]
 TOTAL_KEYWORDS   = ['total', 'grand total', 'sub total', 'subtotal', 'net total', 'closing', 'opening']
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -160,22 +173,31 @@ def _ingest_pdf_to_dataframe(file_bytes, keywords):
         if len(lines) < 5:
             return None, "Scanned PDFs not supported. Please upload Excel or text-based Tally export."
 
-        # Find best header line
+        # Find best header line (min score = 1 now, much more permissive)
         best_idx, best_score = 0, 0
-        for i, line in enumerate(lines[:30]):
+        for i, line in enumerate(lines[:40]):
             score = sum(1 for kw in keywords if kw in line.lower())
             if score > best_score:
                 best_score = score
                 best_idx = i
 
-        if best_score < 2:
+        # Brute-force fallback: if still no match, find the first line with 4+ separate tokens
+        # (likely the table header even if none of our keywords matched)
+        if best_score < 1:
+            for i, line in enumerate(lines[:40]):
+                parts = re.split(r'\s{2,}', line)
+                if len(parts) >= 4:
+                    best_idx = i
+                    best_score = 1
+                    break
+
+        if best_score < 1:
             return None, "Unable to parse PDF structure. Please upload Tally Excel export."
 
         # Split into columns by 2+ consecutive spaces (Tally alignment)
         header_line = lines[best_idx]
         cols = [c.strip() for c in re.split(r'\s{2,}', header_line) if c.strip()]
         if len(cols) < 2:
-            # Single-space fallback
             cols = header_line.split()
 
         data_rows = []
@@ -183,7 +205,6 @@ def _ingest_pdf_to_dataframe(file_bytes, keywords):
             parts = [c.strip() for c in re.split(r'\s{2,}', line) if c.strip()]
             if not parts:
                 continue
-            # Pad or trim to column count
             while len(parts) < len(cols):
                 parts.append('')
             data_rows.append(parts[:len(cols)])
