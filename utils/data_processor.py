@@ -864,6 +864,215 @@ def predict_reorder(sales_df, anchor_df):
         return pd.DataFrame(), str(e)
 
 
+
+# -----------------------------------------------------------------
+# 3. STOCK REGISTER INGESTION  (Inward + Outward as separate files)
+# -----------------------------------------------------------------
+
+_MATERIAL_KW   = {'material', 'description', 'item', 'desc', 'goods', 'mal', 'product', 'particulars'}
+_QTY_KW        = {'qty', 'quantity', 'nos', 'weight', 'wt'}
+_DATE_KW       = {'date', 'dat', 'tarikh'}
+_SUPPLIER_KW   = {'supplier', 'party', 'from', 'vendor', 'received from', 'supplier name'}
+_CUSTOMER_KW   = {'customer', 'goods taken out by', 'taken out by', 'buyer', 'bill to'}
+
+
+def _find_col(columns, keywords, reject=()):
+    """Return the first column name matching any keyword (case-insensitive)."""
+    for col in columns:
+        cl = str(col).lower().strip()
+        if any(kw in cl for kw in keywords) and not any(rk in cl for rk in reject):
+            return col
+    return None
+
+
+def _read_register_excel(file_bytes, fname):
+    """Read an Excel register file into a DataFrame, detecting header row."""
+    import io as _io
+    raw = None
+    for engine in [None, 'xlrd']:
+        try:
+            kw = {'header': None, 'dtype': str}
+            if engine:
+                kw['engine'] = engine
+            raw = pd.read_excel(_io.BytesIO(file_bytes), **kw).fillna('')
+            break
+        except Exception:
+            continue
+    if raw is None:
+        try:
+            tables = pd.read_html(_io.BytesIO(file_bytes))
+            raw = pd.concat(tables, ignore_index=True).fillna('').astype(str)
+        except Exception as e:
+            return None, f"{fname}: Cannot open -- {e}"
+
+    # Find header row: first row with >=2 material/qty/date keywords
+    hdr_row = 0
+    for i in range(min(10, len(raw))):
+        row_text = ' '.join(str(v).lower() for v in raw.iloc[i].values)
+        hits = sum(1 for kw in list(_MATERIAL_KW) + list(_QTY_KW) + list(_DATE_KW) if kw in row_text)
+        if hits >= 2:
+            hdr_row = i
+            break
+
+    import io as _io2
+    df = pd.read_excel(_io2.BytesIO(file_bytes), header=hdr_row, dtype=str).fillna('')
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how='all').reset_index(drop=True)
+    return df, None
+
+
+def ingest_inward_excel(files):
+    """
+    Parse Inward Register Excel files (materials RECEIVED from suppliers).
+    Template columns: SR.NO., DATE, CHALLAN NO., SUPPLIER NAME,
+                      DESCRIPTION OF MATERIAL, QUANTITY, UNIT, RATE, AMOUNT
+    Returns (df, errors) with columns: date, supplier, material, inward, unit
+    """
+    import io as _io
+    if not isinstance(files, list):
+        files = [files]
+
+    frames, errors = [], []
+    for f in files:
+        fname = getattr(f, 'name', str(f))
+        try:
+            fb = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
+        except Exception as e:
+            errors.append(f"{fname}: {e}")
+            continue
+
+        df, err = _read_register_excel(fb, fname)
+        if err:
+            errors.append(err)
+            continue
+
+        cols = list(df.columns)
+        mat_col  = _find_col(cols, _MATERIAL_KW, reject={'rate', 'amount', 'price'})
+        qty_col  = _find_col(cols, _QTY_KW,      reject={'rate', 'amount', 'price', 'value'})
+        date_col = _find_col(cols, _DATE_KW)
+        sup_col  = _find_col(cols, _SUPPLIER_KW)
+
+        if not mat_col:
+            errors.append(f"{fname}: 'Description of Material' column not found.")
+            continue
+        if not qty_col:
+            errors.append(f"{fname}: 'Quantity' column not found.")
+            continue
+
+        out = pd.DataFrame()
+        out['material'] = df[mat_col].astype(str).str.strip()
+        out['inward']   = pd.to_numeric(
+            df[qty_col].astype(str).str.replace(r'[^\d.]', '', regex=True),
+            errors='coerce'
+        )
+        out['date']     = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True) if date_col else pd.NaT
+        out['supplier'] = df[sup_col].astype(str).str.strip() if sup_col else 'UNKNOWN'
+
+        # unit column (optional)
+        unit_col = _find_col(cols, {'unit', 'uom', 'nos', 'kg', 'mtr'}, reject={'rate', 'amount'})
+        out['unit'] = df[unit_col].astype(str).str.strip() if unit_col else ''
+
+        # Remove totals / headers / blank rows
+        skip_kw = {'total', 'grand', 'subtotal', 'description', 'material', 'add your'}
+        out = out[~out['material'].str.lower().str.contains('|'.join(skip_kw), na=False)]
+        out = out.dropna(subset=['inward'])
+        out = out[out['inward'] > 0]
+        out['outward'] = 0.0
+        out['source']  = fname
+
+        if out.empty:
+            errors.append(f"{fname}: No valid inward rows found.")
+        else:
+            frames.append(out)
+
+    if not frames:
+        return pd.DataFrame(), errors
+    return pd.concat(frames, ignore_index=True), errors
+
+
+def ingest_outward_excel(files):
+    """
+    Parse Outward Register Excel files (goods DISPATCHED to customers).
+    Template columns: SR.NO., DATE, CHALLAN NO., GOODS TAKEN OUT BY,
+                      DESCRIPTION OF MATERIAL, QUANTITY, UNIT, VEHICLE NO.
+    Returns (df, errors) with columns: date, customer, material, outward, unit
+    """
+    import io as _io
+    if not isinstance(files, list):
+        files = [files]
+
+    frames, errors = [], []
+    for f in files:
+        fname = getattr(f, 'name', str(f))
+        try:
+            fb = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
+        except Exception as e:
+            errors.append(f"{fname}: {e}")
+            continue
+
+        df, err = _read_register_excel(fb, fname)
+        if err:
+            errors.append(err)
+            continue
+
+        cols = list(df.columns)
+        mat_col  = _find_col(cols, _MATERIAL_KW, reject={'rate', 'amount', 'price'})
+        qty_col  = _find_col(cols, _QTY_KW,      reject={'rate', 'amount', 'price', 'value'})
+        date_col = _find_col(cols, _DATE_KW)
+        cust_col = _find_col(cols, _CUSTOMER_KW)
+
+        if not mat_col:
+            errors.append(f"{fname}: 'Description of Material' column not found.")
+            continue
+        if not qty_col:
+            errors.append(f"{fname}: 'Quantity' column not found.")
+            continue
+
+        out = pd.DataFrame()
+        out['material'] = df[mat_col].astype(str).str.strip()
+        out['outward']  = pd.to_numeric(
+            df[qty_col].astype(str).str.replace(r'[^\d.]', '', regex=True),
+            errors='coerce'
+        )
+        out['date']     = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True) if date_col else pd.NaT
+        out['customer'] = df[cust_col].astype(str).str.strip() if cust_col else 'UNKNOWN'
+
+        unit_col = _find_col(cols, {'unit', 'uom'}, reject={'rate', 'amount'})
+        out['unit'] = df[unit_col].astype(str).str.strip() if unit_col else ''
+
+        skip_kw = {'total', 'grand', 'subtotal', 'description', 'material', 'add your'}
+        out = out[~out['material'].str.lower().str.contains('|'.join(skip_kw), na=False)]
+        out = out.dropna(subset=['outward'])
+        out = out[out['outward'] > 0]
+        out['inward']  = 0.0
+        out['supplier'] = ''
+        out['source']  = fname
+
+        if out.empty:
+            errors.append(f"{fname}: No valid outward rows found.")
+        else:
+            frames.append(out)
+
+    if not frames:
+        return pd.DataFrame(), errors
+    return pd.concat(frames, ignore_index=True), errors
+
+
+def combine_stock_registers(inward_df, outward_df):
+    """
+    Merge inward and outward DataFrames into a unified stock_df
+    expected by compute_stock: columns [material, inward, outward].
+    """
+    parts = []
+    if inward_df is not None and not inward_df.empty:
+        parts.append(inward_df[['material', 'inward', 'outward']])
+    if outward_df is not None and not outward_df.empty:
+        parts.append(outward_df[['material', 'inward', 'outward']])
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
+
+
 def compute_stock(stock_df):
     """
     Aggregate material movements.
@@ -877,12 +1086,13 @@ def compute_stock(stock_df):
                     total_outward=('outward', 'sum'))
                .reset_index())
         agg['current_stock'] = agg['total_inward'] - agg['total_outward']
-        # Highlight low stock: below 20% of total inward
         agg['low_stock'] = agg['current_stock'] < (agg['total_inward'] * 0.2)
         agg.columns = ['Material', 'Total Inward', 'Total Outward', 'Current Stock', 'Low Stock']
         return agg.sort_values('Current Stock').reset_index(drop=True), None
     except Exception as e:
         return pd.DataFrame(), str(e)
+
+
 
 
 def material_outlook(stock_df, predictions_df, sales_df):

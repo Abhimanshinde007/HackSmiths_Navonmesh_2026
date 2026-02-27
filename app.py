@@ -4,7 +4,9 @@ import pandas as pd
 from utils.data_processor import (
     ingest_sales_excel,
     ingest_purchase_excel,
-    ingest_stock_excel,
+    ingest_inward_excel,
+    ingest_outward_excel,
+    combine_stock_registers,
     get_anchor_customers,
     predict_reorder,
     compute_stock,
@@ -130,11 +132,18 @@ with st.sidebar:
         accept_multiple_files=True, key="purch_up"
     )
 
-    st.markdown("### 📦 Stock Register")
-    st.caption("Upload Excel inward/outward register")
-    stock_file = st.file_uploader(
-        "Stock Register", type=["xlsx", "xls"],
-        key="stock_up"
+    st.markdown("### 📥 Inward Register")
+    st.caption("Materials received from suppliers")
+    inward_files = st.file_uploader(
+        "Inward Register", type=["xlsx", "xls"],
+        accept_multiple_files=True, key="inward_up"
+    )
+
+    st.markdown("### 📤 Outward Register")
+    st.caption("Goods dispatched to customers")
+    outward_files = st.file_uploader(
+        "Outward Register", type=["xlsx", "xls"],
+        accept_multiple_files=True, key="outward_up"
     )
 
     st.markdown("---")
@@ -179,23 +188,37 @@ if run_btn:
                     st.session_state.purchase_df = df_p
                     st.sidebar.success(f"✅ Purchase: {len(df_p):,} rows")
 
-            # ── Stock ────────────────────────────────────────
-            if stock_file:
-                df_io, err_io = ingest_stock_excel(stock_file)
-                if err_io:
-                    st.sidebar.error(f"⚠ Stock: {err_io}")
-                elif df_io is not None and not df_io.empty:
-                    st.session_state.stock_df = df_io
-                    summary, _ = compute_stock(df_io)
-                    st.session_state.stock_summary = summary
-                    # Material outlook
-                    outlook, _ = material_outlook(
-                        df_io,
+            # -- Inward Register (materials received) ----------
+            inward_df, outward_df = pd.DataFrame(), pd.DataFrame()
+            if inward_files:
+                inward_df, errs_in = ingest_inward_excel(list(inward_files))
+                for e in errs_in:
+                    st.sidebar.error(f"IN: {e}")
+                if not inward_df.empty:
+                    st.sidebar.success(f"✅ Inward: {len(inward_df):,} rows | {inward_df['material'].nunique()} materials")
+
+            # -- Outward Register (goods dispatched) -----------
+            if outward_files:
+                outward_df, errs_out = ingest_outward_excel(list(outward_files))
+                for e in errs_out:
+                    st.sidebar.error(f"OUT: {e}")
+                if not outward_df.empty:
+                    st.sidebar.success(f"✅ Outward: {len(outward_df):,} rows | {outward_df['material'].nunique()} materials")
+
+            if not inward_df.empty or not outward_df.empty:
+                combined = combine_stock_registers(inward_df, outward_df)
+                st.session_state.stock_df = combined
+                stk, serr = compute_stock(combined)
+                if not serr:
+                    st.session_state.stock_summary = stk
+                    out_df, oerr = material_outlook(
+                        combined,
                         st.session_state.predictions_df,
-                        st.session_state.sales_df,
+                        st.session_state.sales_df
                     )
-                    st.session_state.outlook_df = outlook
-                    st.sidebar.success(f"✅ Stock: {df_io['material'].nunique()} materials")
+                    if not oerr:
+                        st.session_state.outlook_df = out_df
+
 
             st.session_state.processed = True
         st.rerun()
