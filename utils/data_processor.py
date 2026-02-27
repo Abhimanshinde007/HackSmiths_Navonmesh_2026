@@ -73,7 +73,7 @@ def _parse_one_tally_invoice(rows):
     }
 
     for r_idx, row in enumerate(rows):
-        # Flatten each cell by splitting on newlines — this is critical
+        # Flatten each cell by splitting on newlines - this is critical
         # Each cell may contain multi-line content from merged PDF cells
         flat_lines = []
         for cell in row:
@@ -317,7 +317,7 @@ def parse_tally_visual_excel(file):
         if hits >= 3 and prod_hdr_row is None:
             prod_hdr_row = r_idx
             # Find column positions for qty, rate, amount
-            # We'll use positional parsing instead — qty is always 4th main col
+            # We'll use positional parsing instead - qty is always 4th main col
             continue
 
         # ── Product rows ───────────────────────────────────
@@ -393,42 +393,40 @@ def parse_tally_visual_excel(file):
     return result_rows
 
 
-def parse_tally_visual_excel(file):
+def parse_tally_visual_excel(file_bytes, fname='file'):
     """
-    Parse a Tally GST invoice file that was converted from PDF to XLS.
-    Handles multiple invoices per file (merged invoices).
+    Parse a Tally GST invoice file (PDF-to-XLS converted).
+    Accepts raw bytes so that Streamlit UploadedFile seek issues don't occur.
     Returns (df, error).
     """
-    fname = getattr(file, 'name', str(file))
-    try:
-        # Try multiple engines
-        try:
-            raw = pd.read_excel(file, header=None, dtype=str).fillna('')
-        except Exception:
-            raw = pd.read_excel(file, header=None, dtype=str, engine='xlrd').fillna('')
-    except Exception as e:
-        # Try HTML fallback (many PDF converters save XLS as HTML)
-        try:
-            import io as _io
-            if hasattr(file, 'read'):
-                content = file.read()
-                if hasattr(file, 'seek'):
-                    file.seek(0)
-            else:
-                with open(file, 'rb') as fh:
-                    content = fh.read()
-            tables = pd.read_html(_io.BytesIO(content))
-            raw = pd.concat(tables, ignore_index=True).fillna('').astype(str)
-        except Exception as e2:
-            return pd.DataFrame(), f"{fname}: Cannot open file — {e2}"
+    import io as _io
+    raw = None
 
-    # Convert each row to a list of non-empty strings
+    # Try openpyxl first (for .xlsx), then xlrd (for .xls), then HTML
+    for engine in [None, 'xlrd']:
+        try:
+            kwargs = {'header': None, 'dtype': str}
+            if engine:
+                kwargs['engine'] = engine
+            raw = pd.read_excel(_io.BytesIO(file_bytes), **kwargs).fillna('')
+            break
+        except Exception:
+            continue
+
+    if raw is None:
+        try:
+            tables = pd.read_html(_io.BytesIO(file_bytes))
+            raw = pd.concat(tables, ignore_index=True).fillna('').astype(str)
+        except Exception as e:
+            return pd.DataFrame(), f"{fname}: Cannot open - {e}"
+
+    # Convert each row to list of cell values
     all_rows_as_lists = []
     for _, row in raw.iterrows():
         cells = [_cell(v) for v in row.values]
         all_rows_as_lists.append(cells)
 
-    # Find invoice block boundaries by looking for "GST INVOICE" / "TAX INVOICE"
+    # Find invoice block boundaries
     start_indices = []
     for i, row in enumerate(all_rows_as_lists):
         joined = ' '.join(row).lower()
@@ -449,7 +447,7 @@ def parse_tally_visual_excel(file):
     if not all_results:
         return pd.DataFrame(), (
             f"{fname}: No product rows found. "
-            "Ensure the Excel file is a Tally GST Invoice converted from PDF."
+            "Ensure the file is a Tally GST Invoice converted from PDF."
         )
 
     df = pd.DataFrame(all_results)
@@ -459,6 +457,7 @@ def parse_tally_visual_excel(file):
     df['rate']     = pd.to_numeric(df['rate'],     errors='coerce')
     df = df.dropna(subset=['amount']).reset_index(drop=True)
     return df, None
+
 
 
 
@@ -611,9 +610,10 @@ SALES_FIELD_RULES = {
 def ingest_sales_excel(files):
     """
     Accept a list of file-like objects (or a single file).
-    Auto-detects visual Tally XLS (PDF-converted) vs structured tabular Excel.
-    Returns (df, errors) — df has columns: date, customer, product, quantity, rate.
+    Reads each file's bytes ONCE to avoid Streamlit UploadedFile seek issues.
+    Returns (df, errors) - df has columns: date, customer, product, quantity, rate.
     """
+    import io as _io
     if not isinstance(files, list):
         files = [files]
 
@@ -621,24 +621,26 @@ def ingest_sales_excel(files):
     for f in files:
         fname = getattr(f, 'name', str(f))
 
-        # Peek to detect file type
+        # Read ALL bytes upfront - avoids any seek/position issues with Streamlit uploads
         try:
-            raw_peek = pd.read_excel(f, header=None, dtype=str, nrows=5).fillna('')
-            if hasattr(f, 'seek'): f.seek(0)
+            file_bytes = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
+        except Exception as e:
+            errors.append(f"{fname}: Cannot read file bytes - {e}")
+            continue
+
+        # Peek to detect if this is a visual Tally XLS
+        try:
+            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=5).fillna('')
         except Exception:
             try:
-                if hasattr(f, 'seek'): f.seek(0)
-                import io as _io
-                content = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
-                raw_peek = pd.read_html(_io.BytesIO(content))[0].fillna('').astype(str)
-                if hasattr(f, 'seek'): f.seek(0)
+                raw_peek = pd.read_html(_io.BytesIO(file_bytes))[0].fillna('').astype(str)
             except Exception as e:
-                errors.append(f"{fname}: Cannot read file — {e}")
+                errors.append(f"{fname}: Cannot parse file - {e}")
                 continue
 
         if _is_visual_tally_xls(raw_peek):
-            # Visual Tally invoice (PDF-converted) — use dedicated parser
-            df_out, err = parse_tally_visual_excel(f)
+            # Visual Tally invoice (PDF-converted) - pass raw bytes to dedicated parser
+            df_out, err = parse_tally_visual_excel(file_bytes, fname=fname)
             if err:
                 errors.append(err)
             elif df_out is not None and not df_out.empty:
@@ -646,9 +648,8 @@ def ingest_sales_excel(files):
                 frames.append(df_out)
             continue
 
-        # Structured tabular Excel — use strict column mapping
-        if hasattr(f, 'seek'): f.seek(0)
-        df_raw, err = _read_excel_smart(f, SALES_CONTEXT_KW, min_kw=2)
+        # Structured tabular Excel - use strict column mapping
+        df_raw, err = _read_excel_smart(_io.BytesIO(file_bytes), SALES_CONTEXT_KW, min_kw=2)
         if err:
             errors.append(f"{fname}: {err}")
             continue
@@ -682,6 +683,7 @@ def ingest_sales_excel(files):
     return pd.concat(frames, ignore_index=True), errors
 
 
+
 # ─────────────────────────────────────────────────────────────
 # 2. PURCHASE BILLS INGESTION
 # ─────────────────────────────────────────────────────────────
@@ -700,7 +702,7 @@ PURCHASE_FIELD_RULES = {
 def ingest_purchase_excel(files):
     """
     Accept a list of file-like objects.
-    Returns (df, errors) — df has columns: date, supplier, material, quantity, rate.
+    Returns (df, errors) - df has columns: date, supplier, material, quantity, rate.
     """
     if not isinstance(files, list):
         files = [files]
@@ -762,7 +764,7 @@ STOCK_FIELD_RULES = {
 def ingest_stock_excel(file):
     """
     Accept a single stock register Excel file.
-    Returns (df, error) — df has columns: material, inward, outward.
+    Returns (df, error) - df has columns: material, inward, outward.
     """
     fname = getattr(file, 'name', str(file))
     df_raw, err = _read_excel_smart(file, STOCK_CONTEXT_KW, min_kw=2)
