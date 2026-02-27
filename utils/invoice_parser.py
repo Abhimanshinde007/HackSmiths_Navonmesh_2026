@@ -17,10 +17,12 @@ except ImportError:
     PDF_AVAILABLE = False
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -87,11 +89,11 @@ Invoice text:
 def _gemini_parse_page(page_text, api_key):
     """Parse one invoice page via Gemini. Returns (dict, error)."""
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        response = model.generate_content(
-            GEMINI_PROMPT + page_text[:4000],
-            generation_config=genai.types.GenerationConfig(
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=GEMINI_PROMPT + page_text[:4000],
+            config=genai_types.GenerateContentConfig(
                 temperature=0,
                 max_output_tokens=512,
             )
@@ -107,6 +109,7 @@ def _gemini_parse_page(page_text, api_key):
         if '429' in err:
             return None, "RATE_LIMIT"
         return None, f"API error: {err}"
+
 
 
 # ─────────────────────────────────────────────────────────────
