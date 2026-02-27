@@ -10,6 +10,461 @@ import numpy as np
 
 
 # ─────────────────────────────────────────────────────────────
+# TALLY VISUAL EXCEL INVOICE PARSER
+# These are PDF-converted XLS files with NO tabular headers.
+# Structure: Row 0 = "GST INVOICE", Buyer section, then item table.
+# ─────────────────────────────────────────────────────────────
+
+SKIP_PRODUCT_KW = {
+    'sgst', 'cgst', 'igst', 'vat', 'tax', 'total', 'grand total',
+    'amount in words', 'amount chargeable', 'taxable', 'declaration',
+    'freight', 'packing', 'rounding', 'discount', 'advance', 'tds'
+}
+
+UNITS = {'nos', 'pcs', 'kg', 'mtr', 'mts', 'set', 'box', 'ltr', 'unit', 'piece', 'pieces'}
+
+
+def _is_visual_tally_xls(raw_df):
+    """Return True if the file looks like a visual Tally GST invoice."""
+    first_rows_text = ' '.join(
+        str(v).lower() for v in raw_df.iloc[:5].values.flatten() if str(v).strip()
+    )
+    return 'gst invoice' in first_rows_text or 'tax invoice' in first_rows_text
+
+
+def _cell(v):
+    s = str(v).strip() if v is not None else ''
+    if s.lower() in ('nan', 'none', ''):
+        return ''
+    return s
+
+
+def _clean_num(s):
+    try:
+        return float(re.sub(r'[^\d.\-]', '', str(s)))
+    except Exception:
+        return None
+
+
+def _parse_one_tally_invoice(rows):
+    """
+    Parse one Tally GST invoice block.
+    Each 'row' is a list of cell values (strings).
+    Cells may contain embedded newlines from merged PDF cells.
+
+    KEY INSIGHT from diagnostic:
+    - Row 1: mega-cell containing seller info + Buyer section + customer name
+      + Invoice No. cell + Dated cell (all separated by \n within same cells)
+    - Row 10: header row ['Sl No.', 'Description of Goods', 'HSN/SAC', 'Quantity', 'Rate', 'per', 'Amount']
+    - Row 11: product row, amount cell may have SGST/CGST amounts stacked with \n
+    """
+    date_val      = None
+    invoice_no    = None
+    customer      = None
+    result_rows   = []
+    prod_hdr_row  = None
+    col_map       = {}  # {field: column_index}
+
+    PROD_HDR_KW = {'description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate'}
+    SKIP = {
+        'sgst', 'cgst', 'igst', 'vat', 'output tax', 'total', 'grand total',
+        'amount in words', 'amount chargeable', 'taxable', 'declaration',
+        'freight', 'packing', 'rounding', 'discount', 'advance', 'tds'
+    }
+
+    for r_idx, row in enumerate(rows):
+        # Flatten each cell by splitting on newlines — this is critical
+        # Each cell may contain multi-line content from merged PDF cells
+        flat_lines = []
+        for cell in row:
+            for line in str(cell).split('\n'):
+                l = line.strip()
+                if l and l.lower() not in ('nan', 'none'):
+                    flat_lines.append(l)
+
+        full_text = ' '.join(flat_lines)
+        full_low  = full_text.lower()
+
+        # ── Extract Invoice Number ─────────────────────────
+        if not invoice_no:
+            for cell in row:
+                m = re.search(
+                    r'Invoice\s*No\.?\s*[\n\s:]*([A-Z0-9/\-]+)',
+                    str(cell), re.IGNORECASE
+                )
+                if m:
+                    candidate = m.group(1).strip()
+                    if len(candidate) > 2 and candidate.upper() != 'DATED':
+                        invoice_no = candidate
+                        break
+
+        # ── Extract Date ───────────────────────────────────
+        if not date_val:
+            for cell in row:
+                dm = re.search(
+                    r'(?:Dated|Date)[:\s\n]*([\d]{1,2}[-][A-Za-z]{3}[-][\d]{2,4})',
+                    str(cell), re.IGNORECASE
+                )
+                if dm:
+                    date_val = dm.group(1).strip()
+                    break
+            if not date_val:
+                dm = re.search(r'\b(\d{1,2}[-][A-Za-z]{3}[-]\d{2,4})\b', full_text)
+                if dm:
+                    date_val = dm.group(1)
+
+        # ── Extract Customer (Buyer section) ───────────────
+        if not customer:
+            for cell in row:
+                cell_lines = [l.strip() for l in str(cell).split('\n') if l.strip()]
+                buyer_idx = None
+                for li, line in enumerate(cell_lines):
+                    if re.search(r'buyer\s*(\(bill\s*to\))?', line, re.IGNORECASE):
+                        buyer_idx = li
+                        break
+                if buyer_idx is not None:
+                    # Next non-empty line after 'Buyer (Bill to)' is the customer
+                    for next_line in cell_lines[buyer_idx + 1:]:
+                        nl = next_line.strip()
+                        nll = nl.lower()
+                        if len(nl) < 5: continue
+                        if re.match(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]', nl): continue  # GSTIN
+                        if any(kw in nll for kw in ('gstin', 'state', 'contact',
+                                                     'e-mail', 'email', 'invoice',
+                                                     'dispatch', 'dated')): continue
+                        if re.match(r'^\d+[/,]', nl): continue  # address
+                        customer = nl  # keep original casing
+                        break
+
+        # ── Find Product Table Header ──────────────────────
+        if prod_hdr_row is None:
+            hits = sum(1 for kw in PROD_HDR_KW if kw in full_low)
+            if hits >= 3:
+                prod_hdr_row = r_idx
+                # Map column index → field name
+                for ci, cell in enumerate(row):
+                    cl = str(cell).lower().strip()
+                    if 'description' in cl or 'goods' in cl:
+                        col_map['desc'] = ci
+                    elif 'hsn' in cl or 'sac' in cl:
+                        col_map['hsn'] = ci
+                    elif 'qty' in cl or 'quantity' in cl:
+                        col_map['qty'] = ci
+                    elif 'rate' in cl:
+                        col_map['rate'] = ci
+                    elif 'per' == cl.strip():
+                        col_map['per'] = ci
+                    elif 'amount' in cl or 'value' in cl:
+                        col_map['amt'] = ci
+                continue
+
+        # ── Extract Product Rows ───────────────────────────
+        if prod_hdr_row is not None and r_idx > prod_hdr_row:
+            # Build first-line-only text for filtering
+            # CRITICAL: Do NOT use full multi-line cell content for skip check
+            # because product cells have SGST/CGST embedded as sub-lines
+            first_line_text = ' '.join(
+                str(cell).split('\n')[0].strip()
+                for cell in row
+                if str(cell).strip() and str(cell).lower() not in ('nan','none')
+            ).lower()
+
+            # Stop at Total row
+            if re.match(r'^\s*total\b', first_line_text):
+                break
+
+            # Skip rows whose FIRST line is a tax/meta keyword (not the product description)
+            if any(kw == first_line_text.strip() for kw in SKIP):
+                continue
+
+            # Get row cells as a fixed-length padded list
+            padded = list(row) + [''] * 12
+
+            # Description from mapped column or first text cell
+            desc = ''
+            if 'desc' in col_map:
+                raw_desc = str(padded[col_map['desc']]).strip()
+                # Take only first line (ignore SGST/CGST lines embedded in cell)
+                desc = raw_desc.split('\n')[0].strip()
+            if not desc:
+                for ci, cell in enumerate(padded[:8]):
+                    c = str(cell).split('\n')[0].strip()
+                    if ci == 0 and re.match(r'^\d+$', c): continue
+                    if re.match(r'^[\d,\.]+$', c): continue
+                    if re.match(r'^(NOS|PCS|KG|MTR|MTS|SET|BOX|LTR|UNIT)\.?$', c, re.IGNORECASE): continue
+                    if len(c) > 3:
+                        desc = c
+                        break
+
+            if not desc or len(desc) < 3:
+                continue
+            if any(kw in desc.lower() for kw in SKIP):
+                continue
+
+            # Quantity
+            qty = None
+            unit = ''
+            qty_cell = str(padded[col_map.get('qty', 3)]) if len(padded) > col_map.get('qty', 3) else ''
+            qty_m = re.search(
+                r'(\d+(?:\.\d+)?)\s*(NOS|PCS|KG|MTR|MTS|SET|BOX|LTR|UNIT|PIECE|PIECES)?\.?',
+                qty_cell.split('\n')[0], re.IGNORECASE
+            )
+            if qty_m:
+                qty = float(qty_m.group(1))
+                if qty_m.group(2):
+                    unit = qty_m.group(2).upper()
+
+            # Rate
+            rate = None
+            rate_cell = str(padded[col_map.get('rate', 4)]) if len(padded) > col_map.get('rate', 4) else ''
+            rate_m = re.search(r'([\d,]+\.\d{2})', rate_cell.split('\n')[0])
+            if rate_m:
+                rate = float(rate_m.group(1).replace(',', ''))
+
+            # Amount: use mapped column, take FIRST decimal value (ignore SGST/CGST embedded below)
+            amount = None
+            amt_cell = str(padded[col_map.get('amt', 6)]) if len(padded) > col_map.get('amt', 6) else ''
+            amt_first_line = amt_cell.split('\n')[0]  # first line only = product amount, not tax
+            amt_m = re.search(r'([\d,]+\.\d{2})', amt_first_line)
+            if amt_m:
+                amount = float(amt_m.group(1).replace(',', ''))
+
+            if not amount or amount <= 0:
+                continue
+
+            # Per unit
+            if not unit:
+                per_cell = str(padded[col_map.get('per', 5)]).strip().split('\n')[0]
+                if re.match(r'^(NOS|PCS|KG|MTR|MTS|SET|BOX|LTR|UNIT)\.?$', per_cell, re.IGNORECASE):
+                    unit = per_cell.upper().rstrip('.')
+
+            result_rows.append({
+                'customer':   customer or 'UNKNOWN',
+                'date':       date_val,
+                'invoice_no': invoice_no or 'UNKNOWN',
+                'product':    desc,
+                'quantity':   qty,
+                'unit':       unit,
+                'rate':       rate,
+                'amount':     amount,
+            })
+
+    return result_rows
+
+
+def parse_tally_visual_excel(file):
+    """
+    Parse a Tally GST invoice file that was converted from PDF to XLS.
+    Handles multiple invoices per file (merged invoices).
+    Returns (df, error).
+    """
+    date_val   = None
+    invoice_no = None
+    customer   = None
+    buyer_found = False
+    prod_hdr_row = None
+    result_rows = []
+
+    PROD_HDR_KW = {'description', 'goods', 'hsn', 'sac', 'qty', 'quantity', 'amount', 'rate', 'sl'}
+
+    for r_idx, row in enumerate(rows):
+        row_text = ' '.join(row).strip()
+        row_low  = row_text.lower()
+
+        # ── Invoice metadata ───────────────────────────────
+        if 'invoice no' in row_low or 'voucher no' in row_low:
+            # Look for the invoice number pattern in same combined cell text
+            m = re.search(r'(?:invoice no\.?|voucher no\.?)[^\w]*([A-Z0-9/\-]+)', row_text, re.IGNORECASE)
+            if m and not invoice_no:
+                invoice_no = m.group(1).strip()
+            # Date is often in the same row text after "Dated"
+            dm = re.search(r'[Dd]ated[^\d]*(\d{1,2}[-/][A-Za-z0-9]{2,3}[-/]\d{2,4})', row_text)
+            if dm and not date_val:
+                date_val = dm.group(1).strip()
+
+        # Standalone date row detection
+        if not date_val:
+            dm = re.search(r'\b(\d{1,2}[-][A-Za-z]{3}[-]\d{2,4})\b', row_text)
+            if dm:
+                date_val = dm.group(1)
+
+        # ── Buyer section ──────────────────────────────────
+        if 'buyer' in row_low and ('bill to' in row_low or 'bill' in row_low):
+            buyer_found = True
+            continue
+
+        if buyer_found and not customer:
+            # First non-empty, non-address, non-keyword line after "Buyer"
+            for cell in row:
+                c = cell.strip()
+                cl = c.lower()
+                if not c or len(c) < 5:
+                    continue
+                if re.match(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]', c):
+                    continue  # GSTIN
+                if any(kw in cl for kw in ('gstin', 'state', 'contact', 'code',
+                                            'e-mail', 'email', 'invoice', 'dated')):
+                    continue
+                if re.match(r'^\d', c) and ('midc' in cl or 'pune' in cl or
+                                              'satara' in cl or 'road' in cl or 'near' in cl):
+                    continue  # address line
+                customer = c.title()
+                buyer_found = False
+                break
+
+        # ── Product table header ───────────────────────────
+        hits = sum(1 for kw in PROD_HDR_KW if kw in row_low)
+        if hits >= 3 and prod_hdr_row is None:
+            prod_hdr_row = r_idx
+            # Find column positions for qty, rate, amount
+            # We'll use positional parsing instead — qty is always 4th main col
+            continue
+
+        # ── Product rows ───────────────────────────────────
+        if prod_hdr_row is not None and r_idx > prod_hdr_row:
+            # Stop at "Total" row
+            if re.match(r'^\s*total\b', row_low):
+                break
+
+            # Gather all non-empty cells
+            cells = [c for c in row if c.strip()]
+            if not cells:
+                continue
+
+            row_low_flat = ' '.join(cells).lower()
+            if any(kw in row_low_flat for kw in SKIP_PRODUCT_KW):
+                continue
+
+            # Find amount: last decimal number in row
+            all_nums = re.findall(r'[\d,]+\.\d{2}', ' '.join(cells))
+            if not all_nums:
+                continue
+            amount = _clean_num(all_nums[-1])
+            if not amount or amount <= 0:
+                continue
+
+            # Find rate: second-to-last decimal number
+            rate = _clean_num(all_nums[-2]) if len(all_nums) >= 2 else None
+
+            # Find quantity: integer or decimal followed by unit
+            qty = None
+            unit = ''
+            qty_m = re.search(
+                r'(\d+(?:\.\d+)?)\s*(NOS|PCS|KG|MTR|MTS|SET|BOX|LTR|UNIT|PIECE|PIECES)\.?',
+                ' '.join(cells), re.IGNORECASE
+            )
+            if qty_m:
+                qty  = float(qty_m.group(1))
+                unit = qty_m.group(2).upper()
+            else:
+                # No unit found, try standalone integer
+                int_m = re.search(r'\b(\d+)\b', ' '.join(cells[1:4]))
+                if int_m:
+                    qty = float(int_m.group(1))
+
+            # Description: first non-numeric cell (skip row number at position 0)
+            desc = ''
+            for ci, cell in enumerate(cells):
+                c = cell.strip()
+                if ci == 0 and re.match(r'^\d+$', c):
+                    continue  # skip serial number
+                if re.match(r'^[\d,\.]+$', c):
+                    continue
+                if re.match(r'^(NOS|PCS|KG|MTR|MTS|SET|BOX|LTR|UNIT)\.?$', c, re.IGNORECASE):
+                    continue
+                if len(c) > 3:
+                    desc = c
+                    break
+
+            if not desc or any(kw in desc.lower() for kw in SKIP_PRODUCT_KW):
+                continue
+
+            result_rows.append({
+                'customer':   customer or 'UNKNOWN',
+                'date':       date_val,
+                'invoice_no': invoice_no or 'UNKNOWN',
+                'product':    desc,
+                'quantity':   qty,
+                'unit':       unit,
+                'rate':       rate,
+                'amount':     amount,
+            })
+
+    return result_rows
+
+
+def parse_tally_visual_excel(file):
+    """
+    Parse a Tally GST invoice file that was converted from PDF to XLS.
+    Handles multiple invoices per file (merged invoices).
+    Returns (df, error).
+    """
+    fname = getattr(file, 'name', str(file))
+    try:
+        # Try multiple engines
+        try:
+            raw = pd.read_excel(file, header=None, dtype=str).fillna('')
+        except Exception:
+            raw = pd.read_excel(file, header=None, dtype=str, engine='xlrd').fillna('')
+    except Exception as e:
+        # Try HTML fallback (many PDF converters save XLS as HTML)
+        try:
+            import io as _io
+            if hasattr(file, 'read'):
+                content = file.read()
+                if hasattr(file, 'seek'):
+                    file.seek(0)
+            else:
+                with open(file, 'rb') as fh:
+                    content = fh.read()
+            tables = pd.read_html(_io.BytesIO(content))
+            raw = pd.concat(tables, ignore_index=True).fillna('').astype(str)
+        except Exception as e2:
+            return pd.DataFrame(), f"{fname}: Cannot open file — {e2}"
+
+    # Convert each row to a list of non-empty strings
+    all_rows_as_lists = []
+    for _, row in raw.iterrows():
+        cells = [_cell(v) for v in row.values]
+        all_rows_as_lists.append(cells)
+
+    # Find invoice block boundaries by looking for "GST INVOICE" / "TAX INVOICE"
+    start_indices = []
+    for i, row in enumerate(all_rows_as_lists):
+        joined = ' '.join(row).lower()
+        if 'gst invoice' in joined or 'tax invoice' in joined:
+            start_indices.append(i)
+
+    if not start_indices:
+        start_indices = [0]
+
+    end_indices = start_indices[1:] + [len(all_rows_as_lists)]
+
+    all_results = []
+    for start, end in zip(start_indices, end_indices):
+        invoice_rows = all_rows_as_lists[start:end]
+        items = _parse_one_tally_invoice(invoice_rows)
+        all_results.extend(items)
+
+    if not all_results:
+        return pd.DataFrame(), (
+            f"{fname}: No product rows found. "
+            "Ensure the Excel file is a Tally GST Invoice converted from PDF."
+        )
+
+    df = pd.DataFrame(all_results)
+    df['date']     = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+    df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce')
+    df['amount']   = pd.to_numeric(df['amount'],   errors='coerce')
+    df['rate']     = pd.to_numeric(df['rate'],     errors='coerce')
+    df = df.dropna(subset=['amount']).reset_index(drop=True)
+    return df, None
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────
 # COLUMN DETECTION ENGINE
 # ─────────────────────────────────────────────────────────────
 
@@ -156,6 +611,7 @@ SALES_FIELD_RULES = {
 def ingest_sales_excel(files):
     """
     Accept a list of file-like objects (or a single file).
+    Auto-detects visual Tally XLS (PDF-converted) vs structured tabular Excel.
     Returns (df, errors) — df has columns: date, customer, product, quantity, rate.
     """
     if not isinstance(files, list):
@@ -164,39 +620,60 @@ def ingest_sales_excel(files):
     frames, errors = [], []
     for f in files:
         fname = getattr(f, 'name', str(f))
+
+        # Peek to detect file type
+        try:
+            raw_peek = pd.read_excel(f, header=None, dtype=str, nrows=5).fillna('')
+            if hasattr(f, 'seek'): f.seek(0)
+        except Exception:
+            try:
+                if hasattr(f, 'seek'): f.seek(0)
+                import io as _io
+                content = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
+                raw_peek = pd.read_html(_io.BytesIO(content))[0].fillna('').astype(str)
+                if hasattr(f, 'seek'): f.seek(0)
+            except Exception as e:
+                errors.append(f"{fname}: Cannot read file — {e}")
+                continue
+
+        if _is_visual_tally_xls(raw_peek):
+            # Visual Tally invoice (PDF-converted) — use dedicated parser
+            df_out, err = parse_tally_visual_excel(f)
+            if err:
+                errors.append(err)
+            elif df_out is not None and not df_out.empty:
+                df_out['source'] = fname
+                frames.append(df_out)
+            continue
+
+        # Structured tabular Excel — use strict column mapping
+        if hasattr(f, 'seek'): f.seek(0)
         df_raw, err = _read_excel_smart(f, SALES_CONTEXT_KW, min_kw=2)
         if err:
             errors.append(f"{fname}: {err}")
             continue
 
         mapped = _detect_columns(df_raw, SALES_FIELD_RULES)
-
         required = ['date', 'customer', 'quantity']
         missing = [r for r in required if r not in mapped]
         if missing:
             col_list = ', '.join(f'"{m}"' for m in missing)
-            errors.append(f"{fname}: Required column(s) not detected: {col_list}. "
-                          f"Check column names match: Date/Customer/Qty.")
+            errors.append(f"{fname}: Required column(s) not detected: {col_list}.")
             continue
 
-        # Build clean frame
         rename = {v: k for k, v in mapped.items()}
         subset = df_raw[[v for v in mapped.values()]].rename(columns=rename)
-        if 'product' not in subset.columns:
-            subset['product'] = 'UNSPECIFIED'
-        if 'rate' not in subset.columns:
-            subset['rate'] = pd.NA
+        if 'product' not in subset.columns: subset['product'] = 'UNSPECIFIED'
+        if 'rate' not in subset.columns: subset['rate'] = pd.NA
 
         subset = _remove_totals(subset, ['customer', 'product'])
         subset['date']     = pd.to_datetime(subset['date'], errors='coerce', dayfirst=True)
         subset['quantity'] = _clean_numeric(subset['quantity'])
-        subset['rate']     = _clean_numeric(subset['rate']) if 'rate' in subset.columns else pd.NA
-
+        subset['rate']     = _clean_numeric(subset['rate'])
         subset = subset.dropna(subset=['date', 'customer', 'quantity'])
         subset = subset[subset['quantity'] > 0]
         subset['customer'] = subset['customer'].astype(str).str.strip().str.title()
         subset['product']  = subset['product'].astype(str).str.strip()
-        subset             = subset[subset['customer'].str.len() > 1]
         subset['source']   = fname
         frames.append(subset)
 
