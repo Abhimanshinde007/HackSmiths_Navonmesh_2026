@@ -26,10 +26,19 @@ UNITS = {'nos', 'pcs', 'kg', 'mtr', 'mts', 'set', 'box', 'ltr', 'unit', 'piece',
 
 def _is_visual_tally_xls(raw_df):
     """Return True if the file looks like a visual Tally GST invoice."""
+    # Scan first 15 rows to account for deep headers
     first_rows_text = ' '.join(
-        str(v).lower() for v in raw_df.iloc[:5].values.flatten() if str(v).strip()
+        str(v).lower() for v in raw_df.iloc[:15].values.flatten() if str(v).strip()
     )
-    return 'gst invoice' in first_rows_text or 'tax invoice' in first_rows_text
+    if 'gst invoice' in first_rows_text or 'tax invoice' in first_rows_text:
+        return True
+    
+    # Catch Purchase orders that say "Invoice" and "Supplier (Bill from)"
+    # or Sales orders that say "Invoice" and "Buyer"
+    if 'invoice' in first_rows_text and ('supplier' in first_rows_text or 'buyer' in first_rows_text):
+        return True
+        
+    return False
 
 
 def _cell(v):
@@ -630,7 +639,7 @@ def ingest_sales_excel(files):
 
         # Peek to detect if this is a visual Tally XLS
         try:
-            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=5).fillna('')
+            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=15).fillna('')
         except Exception:
             try:
                 raw_peek = pd.read_html(_io.BytesIO(file_bytes))[0].fillna('').astype(str)
@@ -719,7 +728,7 @@ def ingest_purchase_excel(files):
             continue
 
         try:
-            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=5).fillna('')
+            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=15).fillna('')
         except Exception:
             try:
                 raw_peek = pd.read_html(_io.BytesIO(file_bytes))[0].fillna('').astype(str)
