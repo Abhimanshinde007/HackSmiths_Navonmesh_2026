@@ -113,17 +113,17 @@ def _parse_one_tally_invoice(rows):
                 if dm:
                     date_val = dm.group(1)
 
-        # ── Extract Customer (Buyer section) ───────────────
+        # ── Extract Customer/Supplier (Buyer/Seller info section) ───────────────
         if not customer:
             for cell in row:
                 cell_lines = [l.strip() for l in str(cell).split('\n') if l.strip()]
                 buyer_idx = None
                 for li, line in enumerate(cell_lines):
-                    if re.search(r'buyer\s*(\(bill\s*to\))?', line, re.IGNORECASE):
+                    if re.search(r'(buyer|supplier)\s*(\(bill\s*(to|from)\))?', line, re.IGNORECASE):
                         buyer_idx = li
                         break
                 if buyer_idx is not None:
-                    # Next non-empty line after 'Buyer (Bill to)' is the customer
+                    # Next non-empty line after 'Buyer/Supplier' is the party
                     for next_line in cell_lines[buyer_idx + 1:]:
                         nl = next_line.strip()
                         nll = nl.lower()
@@ -704,13 +704,42 @@ def ingest_purchase_excel(files):
     Accept a list of file-like objects.
     Returns (df, errors) - df has columns: date, supplier, material, quantity, rate.
     """
+    import io as _io
     if not isinstance(files, list):
         files = [files]
 
     frames, errors = [], []
     for f in files:
         fname = getattr(f, 'name', str(f))
-        df_raw, err = _read_excel_smart(f, PURCHASE_CONTEXT_KW, min_kw=2)
+
+        try:
+            file_bytes = f.read() if hasattr(f, 'read') else open(f, 'rb').read()
+        except Exception as e:
+            errors.append(f"{fname}: Cannot read file bytes - {e}")
+            continue
+
+        try:
+            raw_peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, nrows=5).fillna('')
+        except Exception:
+            try:
+                raw_peek = pd.read_html(_io.BytesIO(file_bytes))[0].fillna('').astype(str)
+            except Exception as e:
+                errors.append(f"{fname}: Cannot parse file - {e}")
+                continue
+
+        if _is_visual_tally_xls(raw_peek):
+            df_out, err = parse_tally_visual_excel(file_bytes, fname=fname)
+            if err:
+                errors.append(err)
+            elif df_out is not None and not df_out.empty:
+                df_out.rename(columns={'customer': 'supplier'}, inplace=True)
+                df_out['material'] = df_out['product']
+                df_out.drop(columns=['product'], inplace=True)
+                df_out['source'] = fname
+                frames.append(df_out)
+            continue
+
+        df_raw, err = _read_excel_smart(_io.BytesIO(file_bytes), PURCHASE_CONTEXT_KW, min_kw=2)
         if err:
             errors.append(f"{fname}: {err}")
             continue
@@ -1199,22 +1228,22 @@ def ingest_bom_excel(file):
     df = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str).fillna('')
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # Map columns flexibly
-    def _fc(columns, kws):
+    # Map columns flexibly finding combinations of keywords across newlines
+    def _find_col(columns, must_have, or_have):
         for col in columns:
             cl = col.lower()
-            if any(kw in cl for kw in kws):
+            if must_have in cl and any(kw in cl for kw in or_have):
                 return col
         return None
 
     cols = list(df.columns)
-    prod_col  = _fc(cols, ['product', 'name', 'item'])
-    cu_type   = _fc(cols, ['copper type', 'copper'])
-    cu_wt     = _fc(cols, ['copper weight', 'cu weight', 'copper wt'])
-    lam_type  = _fc(cols, ['lamination type', 'lamination'])
-    lam_wt    = _fc(cols, ['lamination weight', 'lamination wt'])
-    bob_type  = _fc(cols, ['bobbin', 'bobbin type'])
-    other_col = _fc(cols, ['other', 'reqs', 'remarks', 'misc'])
+    prod_col  = _find_col(cols, 'product', ['name', 'product', 'item']) or _find_col(cols, 'name', ['product', 'item', 'name'])
+    cu_type   = _find_col(cols, 'copper', ['type', 'wire', 'swg', 'gauge'])
+    cu_wt     = _find_col(cols, 'copper', ['weight', 'wt', 'est', 'kg', 'qty'])
+    lam_type  = _find_col(cols, 'lamination', ['type', 'no', 'ei', 'core'])
+    lam_wt    = _find_col(cols, 'lamination', ['weight', 'wt', 'est', 'kg', 'qty'])
+    bob_type  = _find_col(cols, 'bobbin', ['type', 'bobbin', 'size'])
+    other_col = _find_col(cols, 'other', ['req', 'misc', 'remark', 'other'])
 
     if not prod_col:
         return pd.DataFrame(), f"{fname}: 'Product Name' column not found."
