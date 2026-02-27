@@ -85,8 +85,10 @@ with st.sidebar:
                             st.warning(f"⚠ {e}")
 
                     if df is not None and not df.empty:
-                        # Map to standard schema used by analytics functions
-                        df_std = df.rename(columns={'amount': 'quantity'})
+                        # Drop physical qty column, use invoice amount as 'quantity' for ranking
+                        # (amount = invoice value in ₹, more meaningful for MSME ranking)
+                        df_std = df.drop(columns=['quantity'], errors='ignore').rename(columns={'amount': 'quantity'})
+
                         st.session_state.sales_df = df_std
                         st.session_state.sales_qty_label = 'Invoice Value (₹)'
                         st.session_state.sales_invoice_count = len(sales_pdfs)
