@@ -473,8 +473,8 @@ def _norm(s):
 
 
 def _detect_header_row(raw_df, min_kw, keywords):
-    """Scan first 30 rows, find row with >= min_kw matches."""
-    for i in range(min(30, len(raw_df))):
+    """Scan first 50 rows, find row with >= min_kw matches."""
+    for i in range(min(50, len(raw_df))):
         row_vals = [_norm(v) for v in raw_df.iloc[i].tolist()]
         row_text = ' '.join(row_vals)
         hits = sum(1 for kw in keywords if kw in row_text)
@@ -1209,10 +1209,10 @@ def ingest_bom_excel(file):
 
     cols = list(df.columns)
     prod_col  = _fc(cols, ['product', 'name', 'item'])
-    cu_type   = _fc(cols, ['copper type', 'copper_type'])
-    cu_wt     = _fc(cols, ['copper weight', 'copper_weight', 'cu weight'])
-    lam_type  = _fc(cols, ['lamination type', 'lamination_type'])
-    lam_wt    = _fc(cols, ['lamination weight', 'lamination_weight'])
+    cu_type   = _fc(cols, ['copper type', 'copper'])
+    cu_wt     = _fc(cols, ['copper weight', 'cu weight', 'copper wt'])
+    lam_type  = _fc(cols, ['lamination type', 'lamination'])
+    lam_wt    = _fc(cols, ['lamination weight', 'lamination wt'])
     bob_type  = _fc(cols, ['bobbin', 'bobbin type'])
     other_col = _fc(cols, ['other', 'reqs', 'remarks', 'misc'])
 
