@@ -313,14 +313,40 @@ def _regex_parse(text):
             if re.match(r'^[\d\s%,\.]+$', l):
                 continue
 
-            nums = [float(n.replace(',', '')) for n in re.findall(r'[\d,]+\.\d{2}', l)]
-            desc = re.sub(r'^\d+\s+', '', l)
-            desc = re.sub(r'\s+\d{4,}.*$', '', desc).strip()
-            qty_m = re.search(r'(\d+(?:\.\d+)?)\s*(?:NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\.?', l, re.IGNORECASE)
-            qty = float(qty_m.group(1)) if qty_m else None
-            unit_m = re.search(r'\b(NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\b', l, re.IGNORECASE)
+            # Improved regex to parse visual Excel lines
+            # Example: "1  TRANSFORMER-15 SQ-1849 ISOLATED  8504  20 NOS.  475.00  NOS.  9,500.00"
+            
+            # Step 1: Extract and remove amount (last number)
+            amount_m = re.search(r'([\d,]+\.\d{2})\s*$', l)
+            if not amount_m:
+                continue
+            amount = float(amount_m.group(1).replace(',', ''))
+            l = l[:amount_m.start()].strip()
+            
+            # Step 2: Extract and remove unit (NOS, PCS, etc) from the end
+            unit_m = re.search(r'\b(NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)\.?\s*$', l, re.IGNORECASE)
             unit = unit_m.group(1).upper() if unit_m else ''
-            amount = nums[-1] if nums else None
+            if unit_m:
+                 l = l[:unit_m.start()].strip()
+            
+            # Step 3: Extract and remove rate (number before unit)
+            rate_m = re.search(r'([\d,]+\.\d{2})\s*$', l)
+            if rate_m:
+                 l = l[:rate_m.start()].strip()
+                 
+            # Step 4: Extract and remove quantity + unit
+            qty_m = re.search(r'(\d+(?:\.\d+)?)\s*(NOS|PCS|KG|MTR|SET|BOX|LTR|MTS|UNIT)?\.?\s*$', l, re.IGNORECASE)
+            qty = float(qty_m.group(1)) if qty_m else None
+            if qty_m:
+                 l = l[:qty_m.start()].strip()
+                 if not unit and qty_m.group(2):
+                     unit = qty_m.group(2).upper()
+
+            # Step 5: Remove HSN code at the end
+            l = re.sub(r'\s+\d{4,8}\s*$', '', l)
+            
+            # Step 6: Remove Line Number at the start
+            desc = re.sub(r'^\d+\s+', '', l).strip()
 
             if desc and len(desc) > 3 and amount:
                 items.append({'description': desc, 'quantity': qty, 'unit': unit, 'amount': amount})
