@@ -35,9 +35,13 @@ COLUMN_MAP = {
     # Product variants
     'item': 'product', 'item_name': 'product', 'product': 'product',
     'goods': 'product', 'description': 'product', 'particulars_1': 'product',
-    # Quantity variants
+    # Quantity variants — includes financial value columns for invoice-level registers
     'qty': 'quantity', 'quantity': 'quantity', 'units': 'quantity',
     'nos': 'quantity', 'pcs': 'quantity', 'volume': 'quantity',
+    # Financial value fallbacks (used when no product-qty column exists)
+    'gross_total': 'quantity', 'grosstotal': 'quantity',
+    'value': 'quantity', 'net_amount': 'quantity', 'net_total': 'quantity',
+    'amount': 'quantity', 'invoice_value': 'quantity', 'taxable_value': 'quantity',
 }
 
 TOTAL_KEYWORDS = ['total', 'grand total', 'sub total', 'subtotal', 'net total']
@@ -106,11 +110,19 @@ def load_sales_excel(file):
         # Remove totals rows
         df = df[~df.apply(_is_totals_row, axis=1)]
 
-        # Ensure required columns exist
-        required = ['date', 'customer', 'quantity']
+        # Ensure required columns exist - quantity may come from financial columns
+        required = ['date', 'customer']
         missing = [c for c in required if c not in df.columns]
         if missing:
             return None, f"Could not find columns: {missing}. Detected columns: {list(df.columns)}"
+
+        # If quantity still missing after mapping, try to use any numeric column as fallback
+        if 'quantity' not in df.columns:
+            numeric_cols = df.select_dtypes(include='number').columns.tolist()
+            if numeric_cols:
+                df = df.rename(columns={numeric_cols[0]: 'quantity'})
+            else:
+                return None, f"No numeric column found to use as order value. Columns: {list(df.columns)}"
 
         # Keep only schema columns that exist
         keep_cols = [c for c in ['date', 'customer', 'product', 'quantity'] if c in df.columns]
