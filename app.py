@@ -59,20 +59,35 @@ with st.sidebar:
     
     if st.button("Process Data & Run Insights"):
         if sales_file or stock_file:
-            try:
-                if sales_file:
+            
+            # Process Sales Independently
+            if sales_file:
+                try:
                     raw_sales = pd.read_excel(sales_file)
                     st.session_state.sales_df = clean_and_standardize_sales(raw_sales)
-                if stock_file:
+                except Exception as e:
+                    st.error(f"Failed to process Sales Data: {e}")
+                    st.session_state.sales_df = None
+            
+            # Process Stock Independently
+            if stock_file:
+                try:
                     raw_stock = pd.read_excel(stock_file)
                     st.session_state.stock_df = process_stock_movement(raw_stock)
-                if bom_file:
+                except Exception as e:
+                    st.error(f"Failed to process Stock Data: {e}")
+                    st.session_state.stock_df = None
+                    
+            # Process BOM Independently
+            if bom_file:
+                try:
                     st.session_state.bom_df = pd.read_excel(bom_file)
-                
-                st.session_state.data_processed = True
-                st.success("Data loaded successfully!")
-            except Exception as e:
-                st.error(f"Error processing files: {e}")
+                except Exception as e:
+                    st.error(f"Failed to process BOM Data: {e}")
+                    st.session_state.bom_df = None
+                    
+            st.session_state.data_processed = True
+            st.success("Data loaded gracefully!")
         else:
             st.error("Please upload at least Sales or Stock data.")
 
