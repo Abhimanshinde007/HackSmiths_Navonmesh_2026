@@ -1238,18 +1238,19 @@ def ingest_bom_excel(file):
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     # Map columns flexibly finding combinations of keywords across newlines
-    def _find_col(columns, must_have, or_have):
+    def _find_col(columns, must_have, or_have, reject=None):
+        reject = reject or []
         for col in columns:
             cl = col.lower()
-            if must_have in cl and any(kw in cl for kw in or_have):
+            if must_have in cl and any(kw in cl for kw in or_have) and not any(r in cl for r in reject):
                 return col
         return None
 
     cols = list(df.columns)
     prod_col  = _find_col(cols, 'product', ['name', 'product', 'item']) or _find_col(cols, 'name', ['product', 'item', 'name'])
-    cu_type   = _find_col(cols, 'copper', ['type', 'wire', 'swg', 'gauge'])
+    cu_type   = _find_col(cols, 'copper', ['type', 'wire', 'swg', 'gauge'], reject=['weight', 'wt', 'est', 'kg', 'qty'])
     cu_wt     = _find_col(cols, 'copper', ['weight', 'wt', 'est', 'kg', 'qty'])
-    lam_type  = _find_col(cols, 'lamination', ['type', 'no', 'ei', 'core'])
+    lam_type  = _find_col(cols, 'lamination', ['type', 'no', 'ei', 'core'], reject=['weight', 'wt', 'est', 'kg', 'qty'])
     lam_wt    = _find_col(cols, 'lamination', ['weight', 'wt', 'est', 'kg', 'qty'])
     bob_type  = _find_col(cols, 'bobbin', ['type', 'bobbin', 'size'])
     other_col = _find_col(cols, 'other', ['req', 'misc', 'remark', 'other'])
