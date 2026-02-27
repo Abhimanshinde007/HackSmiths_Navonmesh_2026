@@ -58,10 +58,11 @@ with st.sidebar:
                           key="sales_mode_radio", label_visibility="collapsed")
 
     if sales_mode == "Individual GST Invoice PDFs":
-        st.caption("📄 Upload one or more Tally GST Invoice PDFs")
-        sales_pdfs = st.file_uploader("Upload Invoice PDFs", type=["pdf"],
+        st.caption("📄 Upload Tally GST Invoices (PDF or Converted Excel)")
+        sales_pdfs = st.file_uploader("Upload Invoice Files", type=["pdf", "xlsx", "xls"],
                                        accept_multiple_files=True, key="sales_pdf_up")
         sales_excel = None
+
     else:
         st.caption("📊 Upload a consolidated Sales Register Excel")
         sales_excel = st.file_uploader("Upload Sales Register Excel", type=["xlsx", "xls"],
