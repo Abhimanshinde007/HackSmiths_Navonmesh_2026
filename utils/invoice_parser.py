@@ -136,8 +136,8 @@ def _gemini_parse_all(text, api_key):
                 except json.JSONDecodeError as nested_e:
                     err_pos = getattr(nested_e, 'pos', 0)
                     snippet = raw_clean[max(0, err_pos-40):min(len(raw_clean), err_pos+40)]
-                    last_err = f"JSON format error from {model_name}: {nested_e}. Snippet: '...{snippet}...' "
-                    continue
+                    # Immediate return on JSON error so it doesn't get masked by Quota errs below
+                    return None, f"JSON format error from {model_name}: {nested_e}. Snippet: '...{snippet}...' "
 
             if isinstance(parsed, dict):
                 parsed = [parsed]
@@ -183,43 +183,59 @@ def parse_gst_invoice_pdf(file_bytes, api_key=None):
 
     full_text = '\n'.join(t for _, t in pages)
 
-    # ── Gemini path: one call for everything ──────────────────────
+    # ── Gemini path: process in chunks to prevent JSON breakage ──
     if api_key and GEMINI_AVAILABLE:
-        invoices, err = _gemini_parse_all(full_text, api_key)
-        
-        if err:
-            return [], err
-            
-        if not invoices:
-            return [], "AI returned no data."
-
+        chunk_size = 5
         all_rows = []
-        for inv in invoices:
-            customer   = str(inv.get('customer') or 'UNKNOWN').strip()
-            date_val   = inv.get('date')
-            invoice_no = str(inv.get('invoice_no') or 'UNKNOWN').strip()
-            products   = inv.get('products') or []
+        page_errors = []
 
-            for p in products:
-                desc = str(p.get('description') or '').strip()
-                if not desc or len(desc) < 3:
-                    continue
-                if any(kw in desc.lower() for kw in SKIP_PRODUCT_KEYWORDS):
-                    continue
-                all_rows.append({
-                    'date':       date_val,
-                    'invoice_no': invoice_no,
-                    'customer':   customer,
-                    'product':    desc,
-                    'quantity':   p.get('quantity'),
-                    'unit':       str(p.get('unit') or ''),
-                    'amount':     p.get('amount'),
-                })
+        for i in range(0, len(pages), chunk_size):
+            chunk_pages = pages[i:i + chunk_size]
+            chunk_text = '\n'.join(t for _, t in chunk_pages)
 
-        if not all_rows:
+            invoices, perr = _gemini_parse_all(chunk_text, api_key)
+            if perr:
+                start_p = chunk_pages[0][0]
+                end_p = chunk_pages[-1][0]
+                page_errors.append(f"Pages {start_p}-{end_p}: {perr}")
+                continue
+                
+            if not invoices:
+                continue
+
+            for inv in invoices:
+                customer   = str(inv.get('customer') or 'UNKNOWN').strip()
+                date_val   = inv.get('date')
+                invoice_no = str(inv.get('invoice_no') or 'UNKNOWN').strip()
+                products   = inv.get('products') or []
+
+                for p in products:
+                    desc = str(p.get('description') or '').strip()
+                    if not desc or len(desc) < 3:
+                        continue
+                    if any(kw in desc.lower() for kw in SKIP_PRODUCT_KEYWORDS):
+                        continue
+                    all_rows.append({
+                        'date':       date_val,
+                        'invoice_no': invoice_no,
+                        'customer':   customer,
+                        'product':    desc,
+                        'quantity':   p.get('quantity'),
+                        'unit':       str(p.get('unit') or ''),
+                        'amount':     p.get('amount'),
+                    })
+
+            # Delay between chunks to avoid rate limits
+            if i + chunk_size < len(pages):
+                time.sleep(2)
+
+        if not all_rows and page_errors:
+            return [], f"AI parse failed: {'; '.join(page_errors)}"
+        elif not all_rows:
             return [], "AI parsed invoices but found 0 valid products."
 
         return all_rows, None
+
 
     # ── Regex fallback (no API key) ─────────────────────────────
     return _regex_parse(full_text)
