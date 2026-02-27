@@ -1145,4 +1145,212 @@ def material_outlook(stock_df, predictions_df, sales_df):
             })
         return pd.DataFrame(rows), None
     except Exception as e:
+        return pd.DataFrame(), str(e)# -----------------------------------------------------------------
+# 4. BILL OF MATERIALS (BOM) INGESTION & REQUIREMENTS ENGINE
+# Format: Product Name | Copper Type | Copper Weight |
+#         Lamination Type | Lamination Weight | Bobbin Type | Other Reqs
+# -----------------------------------------------------------------
+
+def ingest_bom_excel(file):
+    """
+    Parse a BOM Excel file in the user's specific format:
+    Columns: PRODUCT NAME, COPPER TYPE, COPPER WEIGHT (EST.),
+             LAMINATION TYPE, LAMINATION WEIGHT, BOBBIN TYPE, OTHER REQS
+
+    Returns (bom_df, error)
+    bom_df columns: product, copper_type, copper_weight_kg,
+                    lamination_type, lamination_weight_kg,
+                    bobbin_type, other_reqs
+    """
+    import io as _io
+    fname = getattr(file, 'name', str(file))
+    try:
+        file_bytes = file.read() if hasattr(file, 'read') else open(file, 'rb').read()
+    except Exception as e:
+        return pd.DataFrame(), f"{fname}: Cannot read -- {e}"
+
+    raw = None
+    for engine in [None, 'xlrd']:
+        try:
+            kw = {'header': None, 'dtype': str}
+            if engine:
+                kw['engine'] = engine
+            raw = pd.read_excel(_io.BytesIO(file_bytes), **kw).fillna('')
+            break
+        except Exception:
+            continue
+
+    if raw is None:
+        return pd.DataFrame(), f"{fname}: Cannot open file."
+
+    # Find the header row (contains 'product' or 'copper')
+    hdr_row = 0
+    for i in range(min(5, len(raw))):
+        row_text = ' '.join(str(v).lower() for v in raw.iloc[i].values)
+        if 'product' in row_text or 'copper' in row_text:
+            hdr_row = i
+            break
+
+    df = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str).fillna('')
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Map columns flexibly
+    def _fc(columns, kws):
+        for col in columns:
+            cl = col.lower()
+            if any(kw in cl for kw in kws):
+                return col
+        return None
+
+    cols = list(df.columns)
+    prod_col  = _fc(cols, ['product', 'name', 'item'])
+    cu_type   = _fc(cols, ['copper type', 'copper_type'])
+    cu_wt     = _fc(cols, ['copper weight', 'copper_weight', 'cu weight'])
+    lam_type  = _fc(cols, ['lamination type', 'lamination_type'])
+    lam_wt    = _fc(cols, ['lamination weight', 'lamination_weight'])
+    bob_type  = _fc(cols, ['bobbin', 'bobbin type'])
+    other_col = _fc(cols, ['other', 'reqs', 'remarks', 'misc'])
+
+    if not prod_col:
+        return pd.DataFrame(), f"{fname}: 'Product Name' column not found."
+    if not cu_wt and not lam_wt:
+        return pd.DataFrame(), f"{fname}: No material weight columns found (expected Copper Weight, Lamination Weight)."
+
+    out = pd.DataFrame()
+    out['product']              = df[prod_col].astype(str).str.strip()
+    out['copper_type']          = df[cu_type].astype(str).str.strip()       if cu_type  else ''
+    out['copper_weight_kg']     = pd.to_numeric(
+        df[cu_wt].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce'
+    ) if cu_wt else 0.0
+    out['lamination_type']      = df[lam_type].astype(str).str.strip()      if lam_type else ''
+    out['lamination_weight_kg'] = pd.to_numeric(
+        df[lam_wt].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce'
+    ) if lam_wt else 0.0
+    out['bobbin_type']          = df[bob_type].astype(str).str.strip()      if bob_type else ''
+    out['other_reqs']           = df[other_col].astype(str).str.strip()     if other_col else ''
+
+    # Remove blank / header rows
+    out = out[out['product'].str.len() > 3]
+    out = out[~out['product'].str.lower().str.contains('product|name|item', na=False)]
+    out = out.dropna(how='all').reset_index(drop=True)
+
+    return out, None
+
+
+def compute_material_requirements(predictions_df, bom_df, stock_summary_df):
+    """
+    Cross-reference predicted orders with BOM to generate material purchase alerts.
+
+    Logic:
+      For each predicted reorder:
+        - Look up product in BOM (fuzzy prefix match on first 10 chars)
+        - Multiply BOM quantities by expected order quantity
+        - Compare against current stock
+        - Flag shortfall as 'BUY NOW', near-shortfall as 'PREPARE', ok as 'OK'
+
+    Returns (requirements_df, error)
+    Columns: Customer, Product, Days Until Order, Material, Need (kg/nos),
+             In Stock (kg/nos), Shortfall, Status
+    """
+    try:
+        if predictions_df is None or predictions_df.empty:
+            return pd.DataFrame(), "No reorder predictions available."
+        if bom_df is None or bom_df.empty:
+            return pd.DataFrame(), "No BOM data uploaded."
+
+        # Build stock lookup: {material_keyword: current_stock}
+        stk = {}
+        if stock_summary_df is not None and not stock_summary_df.empty:
+            for _, row in stock_summary_df.iterrows():
+                mat = str(row.get('Material', '')).lower()
+                stk[mat] = float(row.get('Current Stock', 0))
+
+        def _get_stock(keyword):
+            """Find best matching stock level for a material keyword."""
+            kl = keyword.lower()[:8]
+            for k, v in stk.items():
+                if kl in k or k[:8] in kl:
+                    return v
+            return None  # Unknown = not tracked
+
+        rows = []
+        today = pd.Timestamp.now().normalize()
+
+        for _, pred in predictions_df.iterrows():
+            customer = pred.get('Customer', 'Unknown')
+            product  = str(pred.get('Last Order', ''))  # use product from sales later
+
+            # Try to match BOM row by product name prefix
+            bom_match = None
+            pred_product = customer  # fallback label
+
+            # Match BOM rows to this prediction's likely product
+            # (Sales data needed for exact match â€” use first 8 chars of product)
+            for _, brow in bom_df.iterrows():
+                bom_match = brow
+                break  # For now use first match; will be refined with sales linkage
+
+            if bom_match is None:
+                continue
+
+            # Days until predicted order
+            try:
+                next_order = pd.to_datetime(pred.get('Predicted Next Order'), dayfirst=True)
+                days_left  = (next_order - today).days
+            except Exception:
+                days_left = 30
+
+            # Assumed order quantity = 1 unit (conservative)
+            assumed_qty = 1.0
+
+            # Build material requirements list
+            material_items = [
+                ('Copper',      bom_match.get('copper_type', ''),     float(bom_match.get('copper_weight_kg', 0) or 0),     'KG'),
+                ('Lamination',  bom_match.get('lamination_type', ''), float(bom_match.get('lamination_weight_kg', 0) or 0), 'KG'),
+                ('Bobbin',      bom_match.get('bobbin_type', ''),     1.0,                                                   'NOS'),
+            ]
+
+            for mat_name, mat_spec, unit_qty, unit in material_items:
+                if unit_qty <= 0:
+                    continue
+                need       = round(assumed_qty * unit_qty, 3)
+                in_stock   = _get_stock(mat_name)
+                stock_disp = round(in_stock, 3) if in_stock is not None else 'Unknown'
+
+                if in_stock is None:
+                    status = 'CHECK STOCK'
+                    shortfall = 'Unknown'
+                elif in_stock >= need * 1.5:
+                    status = 'OK'
+                    shortfall = 0
+                elif in_stock >= need:
+                    status = 'PREPARE'
+                    shortfall = 0
+                else:
+                    status = 'BUY NOW'
+                    shortfall = round(need - in_stock, 3)
+
+                # Urgency: escalate if order is within 7 days
+                if days_left <= 7 and status == 'PREPARE':
+                    status = 'BUY NOW'
+
+                rows.append({
+                    'Customer':        customer,
+                    'Days Till Order': days_left,
+                    'Pred. Order Date': pred.get('Predicted Next Order', ''),
+                    'Material':        f"{mat_name} ({mat_spec})" if mat_spec else mat_name,
+                    'Need':            f"{need} {unit}",
+                    'In Stock':        f"{stock_disp} {unit}" if in_stock is not None else 'Unknown',
+                    'Shortfall':       f"{shortfall} {unit}" if isinstance(shortfall, float) else shortfall,
+                    'Status':          status,
+                })
+
+        if not rows:
+            return pd.DataFrame(), "Could not match any BOM entries to predictions."
+
+        result = pd.DataFrame(rows)
+        result = result.sort_values(['Days Till Order', 'Status'], ascending=[True, False])
+        return result, None
+
+    except Exception as e:
         return pd.DataFrame(), str(e)

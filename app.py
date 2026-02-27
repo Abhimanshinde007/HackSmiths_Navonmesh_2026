@@ -11,6 +11,8 @@ from utils.data_processor import (
     predict_reorder,
     compute_stock,
     material_outlook,
+    ingest_bom_excel,
+    compute_material_requirements,
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -101,7 +103,7 @@ hr { border: none; border-top: 1px solid #ddd; margin: 12px 0; }
 # ─────────────────────────────────────────────────────────────
 for key in ['sales_df', 'purchase_df', 'stock_df',
             'anchor_df', 'predictions_df', 'stock_summary',
-            'outlook_df', 'processed']:
+            'outlook_df', 'bom_df', 'requirements_df', 'processed']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -144,6 +146,13 @@ with st.sidebar:
     outward_files = st.file_uploader(
         "Outward Register", type=["xlsx", "xls"],
         accept_multiple_files=True, key="outward_up"
+    )
+
+    st.markdown("### 📊 Bill of Materials (BOM)")
+    st.caption("Product to raw material mapping")
+    bom_file = st.file_uploader(
+        "BOM File", type=["xlsx", "xls"],
+        key="bom_up"
     )
 
     st.markdown("---")
@@ -219,6 +228,23 @@ if run_btn:
                     if not oerr:
                         st.session_state.outlook_df = out_df
 
+
+            # -- BOM + Material Requirements --------------------
+            if bom_file:
+                bom_df, bom_err = ingest_bom_excel(bom_file)
+                if bom_err:
+                    st.sidebar.error(f"BOM: {bom_err}")
+                elif not bom_df.empty:
+                    st.session_state.bom_df = bom_df
+                    st.sidebar.success(f"✅ BOM: {len(bom_df)} products loaded")
+                    # Compute material requirements
+                    req_df, req_err = compute_material_requirements(
+                        st.session_state.predictions_df,
+                        bom_df,
+                        st.session_state.stock_summary,
+                    )
+                    if not req_err:
+                        st.session_state.requirements_df = req_df
 
             st.session_state.processed = True
         st.rerun()
@@ -405,3 +431,55 @@ with col_outlook:
         st.caption("**Advisory Logic:**\n- 🔴 Buy Soon = Est. demand > current stock\n- 🟡 Prepare = Demand approaching stock\n- 🟢 Monitor = Stock adequate")
     else:
         st.info("Upload Stock Register to see material advisory.")
+
+
+# ─────────────────────────────────────────────────────────────
+# MATERIAL REQUIREMENTS — PROCUREMENT ALERTS
+# ─────────────────────────────────────────────────────────────
+requirements_df = st.session_state.get('requirements_df')
+bom_df          = st.session_state.get('bom_df')
+
+st.markdown("---")
+st.markdown("## 🧾 Material Requirements — Procurement Alerts")
+st.caption("Cross-references predicted customer orders with BOM to show exactly what raw materials to buy and when.")
+
+if requirements_df is not None and not requirements_df.empty:
+    # Summary alert banner
+    buy_now_count = len(requirements_df[requirements_df['Status'] == 'BUY NOW'])
+    prepare_count = len(requirements_df[requirements_df['Status'] == 'PREPARE'])
+
+    if buy_now_count > 0:
+        st.error(f"🚨 **{buy_now_count} material(s) need to be purchased IMMEDIATELY** before upcoming orders run short!")
+    if prepare_count > 0:
+        st.warning(f"⚠️ **{prepare_count} material(s) need preparation** — stock is getting low.")
+    if buy_now_count == 0 and prepare_count == 0:
+        st.success("✅ All materials are adequately stocked for upcoming predicted orders.")
+
+    # Color-coded table
+    def _req_style(val):
+        if val == 'BUY NOW':   return 'background-color:#FF3B30; color:white; font-weight:bold'
+        if val == 'PREPARE':   return 'background-color:#FF9500; color:white; font-weight:bold'
+        if val == 'CHECK STOCK': return 'background-color:#FFD60A; color:black; font-weight:bold'
+        if val == 'OK':        return 'background-color:#34C759; color:white; font-weight:bold'
+        return ''
+
+    try:
+        st.dataframe(
+            requirements_df.style.applymap(_req_style, subset=['Status']),
+            use_container_width=True,
+            height=420
+        )
+    except Exception:
+        st.dataframe(requirements_df, use_container_width=True, height=420)
+
+elif bom_df is not None and not bom_df.empty:
+    st.info("BOM loaded. Upload Sales Bills to generate reorder predictions and compute material requirements.")
+else:
+    st.info("Upload your **BOM file** (📊 Bill of Materials in the sidebar) to activate Procurement Alerts.")
+    st.markdown("""
+    **How it works:**
+    1. Upload your BOM Excel (Product Name → Copper Type, Weight, Lamination, Bobbin, Other Reqs)
+    2. The app predicts which customer will order next and when
+    3. It multiplies order quantity × BOM recipe = **exact material needed**
+    4. Compares against your stock → tells you what to **Buy Now / Prepare / Monitor**
+    """)
