@@ -47,7 +47,7 @@ st.session_state.loaded_once = True
 
 for key in ['sales_df', 'purchase_df', 'stock_df',
             'anchor_df', 'predictions_df', 'stock_summary',
-            'outlook_df', 'bom_df', 'requirements_df']:
+            'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
     if key not in st.session_state:
         st.session_state[key] = loaded.get(key, None)
 
@@ -115,13 +115,26 @@ with tab_ingest:
         run_btn = st.button("▶ Process & Generate Insights", type="primary", use_container_width=True)
         st.markdown("<br>", unsafe_allow_html=True)
         
+        
         if st.button("🔄 Reset All Data", help="Clear all stored data and refresh app", use_container_width=True):
             clear_data()
-            for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df']:
+            for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
                 st.session_state[key] = None
             st.session_state.processed = False
             st.session_state.loaded_once = False
             st.rerun()
+            
+    # -- Display Persisted Logs --
+    if st.session_state.get('process_logs'):
+        st.markdown("### 📝 Last Processing Logs")
+        for log_type, log_msg in st.session_state.process_logs:
+            if log_type == 'error':
+                st.error(log_msg)
+            elif log_type == 'warning':
+                st.warning(log_msg)
+            else:
+                st.success(log_msg)
+        st.markdown("---")
 
     if run_btn:
         if not sales_files and not purchase_files and not inward_files and not outward_files and not bom_file:
@@ -129,44 +142,45 @@ with tab_ingest:
         else:
             with st.spinner("Processing files..."):
                 st.markdown("---")
+                new_logs = []
                 
                 # ── Sales ────────────────────────────────────────
                 if sales_files:
                     df_s, errs_s = ingest_sales_excel(sales_files)
-                    for e in errs_s: st.error(f"⚠ Sales Error: {e}")
+                    for e in errs_s: new_logs.append(('error', f"⚠ Sales Error: {e}"))
                     if df_s is not None and not df_s.empty:
                         st.session_state.sales_df = df_s
                         anchor, aerr = get_anchor_customers(df_s)
-                        if aerr: st.warning(f"Anchor: {aerr}")
+                        if aerr: new_logs.append(('warning', f"Anchor: {aerr}"))
                         else:
                             st.session_state.anchor_df = anchor
                             pred, perr = predict_reorder(df_s, anchor)
                             if not perr: st.session_state.predictions_df = pred
-                        st.success(f"✅ Sales: {len(df_s):,} rows | {df_s['customer'].nunique()} customers")
+                        new_logs.append(('success', f"✅ Sales: {len(df_s):,} rows | {df_s['customer'].nunique()} customers"))
                     else:
-                        if not errs_s: st.warning("Sales: No valid rows extracted.")
+                        if not errs_s: new_logs.append(('warning', "Sales: No valid rows extracted."))
                 
                 # ── Purchases ────────────────────────────────────
                 if purchase_files:
                     df_p, errs_p = ingest_purchase_excel(purchase_files)
-                    for e in errs_p: st.error(f"⚠ Purchase Error: {e}")
+                    for e in errs_p: new_logs.append(('error', f"⚠ Purchase Error: {e}"))
                     if df_p is not None and not df_p.empty:
                         st.session_state.purchase_df = df_p
-                        st.success(f"✅ Purchase: {len(df_p):,} rows")
+                        new_logs.append(('success', f"✅ Purchase: {len(df_p):,} rows"))
                 
                 # -- Inward / Outward --------------------------
                 inward_df, outward_df = pd.DataFrame(), pd.DataFrame()
                 if inward_files:
                     inward_df, errs_in = ingest_inward_excel(list(inward_files))
-                    for e in errs_in: st.error(f"⚠ IN Error: {e}")
+                    for e in errs_in: new_logs.append(('error', f"⚠ IN Error: {e}"))
                     if not inward_df.empty:
-                        st.success(f"✅ Inward: {len(inward_df):,} rows | {inward_df['material'].nunique()} materials")
+                        new_logs.append(('success', f"✅ Inward: {len(inward_df):,} rows | {inward_df['material'].nunique()} materials"))
                 
                 if outward_files:
                     outward_df, errs_out = ingest_outward_excel(list(outward_files))
-                    for e in errs_out: st.error(f"⚠ OUT Error: {e}")
+                    for e in errs_out: new_logs.append(('error', f"⚠ OUT Error: {e}"))
                     if not outward_df.empty:
-                        st.success(f"✅ Outward: {len(outward_df):,} rows | {outward_df['material'].nunique()} materials")
+                        new_logs.append(('success', f"✅ Outward: {len(outward_df):,} rows | {outward_df['material'].nunique()} materials"))
                 
                 if not inward_df.empty or not outward_df.empty:
                     combined = combine_stock_registers(inward_df, outward_df)
@@ -185,10 +199,10 @@ with tab_ingest:
                 # -- BOM + Material Requirements --------------------
                 if bom_file:
                     bom_df, bom_err = ingest_bom_excel(bom_file)
-                    if bom_err: st.error(f"⚠ BOM Error: {bom_err}")
+                    if bom_err: new_logs.append(('error', f"⚠ BOM Error: {bom_err}"))
                     elif not bom_df.empty:
                         st.session_state.bom_df = bom_df
-                        st.success(f"✅ BOM: {len(bom_df)} products loaded")
+                        new_logs.append(('success', f"✅ BOM: {len(bom_df)} products loaded"))
                         req_df, req_err = compute_material_requirements(
                             st.session_state.predictions_df,
                             bom_df,
@@ -200,8 +214,9 @@ with tab_ingest:
                 # Persist to local disk
                 saved_count = save_data(st.session_state)
                 if saved_count > 0:
-                    st.success(f"💾 Securely cached {saved_count} datasets locally for persistence.")
+                    new_logs.append(('success', f"💾 Securely cached {saved_count} datasets locally for persistence."))
 
+                st.session_state.process_logs = new_logs
                 st.session_state.processed = True
             st.rerun()
 

@@ -500,7 +500,7 @@ PRODUCT_KEYWORDS  = {'item', 'product', 'description', 'stock item', 'goods', 'i
 PRODUCT_REJECT    = {'rate', 'amount', 'price'}
 
 # QUANTITY: allowed keywords, must NOT contain rate/amount/price/value
-QUANTITY_KEYWORDS = {'qty', 'quantity', 'billed qty', 'actual qty', 'units', 'nos', 'billed_qty', 'actual_qty', 'pcs', 'pieces'}
+QUANTITY_KEYWORDS = {'qty', 'quantity', 'billed qty', 'actual qty', 'units', 'nos', 'billed_qty', 'actual_qty', 'pcs', 'pieces', 'weight', 'wt', 'net wt', 'gross wt'}
 QUANTITY_REJECT   = {'rate', 'amount', 'price', 'value'}
 
 # RATE: allowed, must NOT contain qty/quantity
