@@ -199,15 +199,23 @@ with tab_ingest:
                 # -- BOM + Material Requirements --------------------
                 if bom_file:
                     bom_df, bom_err = ingest_bom_excel(bom_file)
-                    if bom_err: new_logs.append(('error', f"⚠ BOM Error: {bom_err}"))
-                    elif not bom_df.empty:
-                        st.session_state.bom_df = bom_df
-                        new_logs.append(('success', f"✅ BOM: {len(bom_df)} products loaded"))
-                        req_df, req_err = compute_material_requirements(
-                            st.session_state.predictions_df,
-                            bom_df,
-                            st.session_state.stock_summary,
-                        )
+                    
+                    if bom_err and "Product Name" in bom_err:
+                        # Fatal error (no product names)
+                        new_logs.append(('error', f"⚠ BOM Error: {bom_err}"))
+                    else:
+                        if bom_err:
+                            # Non-fatal warning (e.g. missing weights)
+                            new_logs.append(('warning', f"⚠ BOM Notice: {bom_err}"))
+                        
+                        if not bom_df.empty:
+                            st.session_state.bom_df = bom_df
+                            new_logs.append(('success', f"✅ BOM: {len(bom_df)} products loaded"))
+                            req_df, req_err = compute_material_requirements(
+                                st.session_state.predictions_df,
+                                bom_df,
+                                st.session_state.stock_summary,
+                            )
                         if not req_err:
                             st.session_state.requirements_df = req_df
                 

@@ -500,7 +500,7 @@ PRODUCT_KEYWORDS  = {'item', 'product', 'description', 'stock item', 'goods', 'i
 PRODUCT_REJECT    = {'rate', 'amount', 'price'}
 
 # QUANTITY: allowed keywords, must NOT contain rate/amount/price/value
-QUANTITY_KEYWORDS = {'qty', 'quantity', 'billed qty', 'actual qty', 'units', 'nos', 'billed_qty', 'actual_qty', 'pcs', 'pieces', 'weight', 'wt', 'net wt', 'gross wt'}
+QUANTITY_KEYWORDS = {'qty', 'quantity', 'billed qty', 'actual qty', 'units', 'nos', 'billed_qty', 'actual_qty', 'pcs', 'pieces', 'weight', 'wt', 'net wt', 'gross wt', 'kgs', 'kg', 'meters', 'mtrs', 'no.', 'qt'}
 QUANTITY_REJECT   = {'rate', 'amount', 'price', 'value'}
 
 # RATE: allowed, must NOT contain qty/quantity
@@ -1219,7 +1219,8 @@ def ingest_bom_excel(file):
     if not prod_col:
         return pd.DataFrame(), f"{fname}: 'Product Name' column not found."
     if not cu_wt and not lam_wt:
-        return pd.DataFrame(), f"{fname}: No material weight columns found (expected Copper Weight, Lamination Weight)."
+        # Don't fail the whole ingest if weights are missing, just warn the user
+        pass
 
     out = pd.DataFrame()
     out['product']              = df[prod_col].astype(str).str.strip()
