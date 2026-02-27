@@ -61,7 +61,7 @@ def _detect_header_row(df_raw):
 
 
 def _standardize_columns(df):
-    """Lowercase, strip, deduplicate and map column names to standard schema."""
+    """Lowercase, strip, map column names to standard schema, then deduplicate."""
     df.columns = [
         str(c).strip().lower()
                  .replace(" ", "_")
@@ -80,7 +80,23 @@ def _standardize_columns(df):
                     rename[col] = std
                     break
     df = df.rename(columns=rename)
-    # Keep only schema columns if they exist, but don't drop extras yet
+
+    # ── CRITICAL: resolve duplicate column names caused by multiple source columns
+    # mapping to the same schema name (e.g. both 'value' and 'gross_total' → 'quantity').
+    # For each duplicate, keep the first occurrence and drop the rest.
+    seen = {}
+    new_cols = []
+    for col in df.columns:
+        if col not in seen:
+            seen[col] = 0
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            new_cols.append(f"{col}__drop_{seen[col]}")
+    df.columns = new_cols
+    drop_cols = [c for c in df.columns if '__drop_' in c]
+    df = df.drop(columns=drop_cols)
+
     return df
 
 
