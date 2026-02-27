@@ -13,6 +13,10 @@ from utils.data_processor import (
     material_outlook,
     ingest_bom_excel,
     compute_material_requirements,
+    load_data,
+    save_data,
+    clear_data,
+    get_commodity_rates
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -35,16 +39,22 @@ except Exception:
     pass
 
 # ─────────────────────────────────────────────────────────────
-# SESSION STATE
+# SESSION STATE & PERSISTENCE
 # ─────────────────────────────────────────────────────────────
+# Attempt to load saved data first
+loaded = load_data() if 'loaded_once' not in st.session_state else {}
+st.session_state.loaded_once = True
+
 for key in ['sales_df', 'purchase_df', 'stock_df',
             'anchor_df', 'predictions_df', 'stock_summary',
-            'outlook_df', 'bom_df', 'requirements_df', 'processed']:
+            'outlook_df', 'bom_df', 'requirements_df']:
     if key not in st.session_state:
-        st.session_state[key] = None
+        st.session_state[key] = loaded.get(key, None)
 
 if 'processed' not in st.session_state:
-    st.session_state.processed = False
+    # If we successfully loaded sales or stock, flag as processed
+    st.session_state.processed = (loaded.get('sales_df') is not None) or (loaded.get('stock_df') is not None)
+
 
 # ─────────────────────────────────────────────────────────────
 # HEADER
@@ -53,9 +63,10 @@ st.markdown("# 🏭 Enterprise Inventory Intelligence")
 st.markdown("*Predictive procurement & stock analytics for MSMEs — ERP grade*")
 st.markdown("---")
 
-tab_dash, tab_bom, tab_ingest = st.tabs([
+tab_dash, tab_bom, tab_commodity, tab_ingest = st.tabs([
     "📊 Executive Dashboard", 
     "🧾 BOM & Procurement", 
+    "📈 Commodity Insights",
     "⚙️ Data Ingestion"
 ])
 
@@ -93,7 +104,16 @@ with tab_ingest:
         bom_file = st.file_uploader("BOM File", type=["xlsx", "xls"], key="bom_up")
         
         st.markdown("<br>", unsafe_allow_html=True)
-        run_btn = st.button("▶ Process & Generate Insights", use_container_width=True)
+        run_btn = st.button("▶ Process & Generate Insights", type="primary", use_container_width=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if st.button("🔄 Reset All Data", help="Clear all stored data and refresh app", use_container_width=True):
+            clear_data()
+            for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df']:
+                st.session_state[key] = None
+            st.session_state.processed = False
+            st.session_state.loaded_once = False
+            st.rerun()
 
     if run_btn:
         if not sales_files and not purchase_files and not inward_files and not outward_files and not bom_file:
@@ -169,6 +189,11 @@ with tab_ingest:
                         if not req_err:
                             st.session_state.requirements_df = req_df
                 
+                # Persist to local disk
+                saved_count = save_data(st.session_state)
+                if saved_count > 0:
+                    st.success(f"💾 Securely cached {saved_count} datasets locally for persistence.")
+
                 st.session_state.processed = True
             st.rerun()
 
@@ -220,6 +245,13 @@ with tab_dash:
     with st.container():
         st.markdown('<div class="panel-header">📊 Sales Intelligence</div>', unsafe_allow_html=True)
         if sales_df is not None and not sales_df.empty:
+            if 'date' in sales_df.columns and 'quantity' in sales_df.columns:
+                trend_df = sales_df.dropna(subset=['date', 'quantity'])
+                if not trend_df.empty:
+                    st.markdown("**Sales Volume Trend**")
+                    daily = trend_df.groupby('date')['quantity'].sum().reset_index()
+                    st.line_chart(daily.set_index('date'))
+
             if anchor_df is not None and not anchor_df.empty:
                 st.markdown("**Core Revenue Drivers (Anchor Clients)**")
                 st.dataframe(
@@ -330,3 +362,37 @@ with tab_bom:
         st.info("BOM loaded. Upload Sales Bills to generate reorder predictions and compute material requirements.")
     else:
         st.info("Upload your **BOM file** in the Data Ingestion tab to activate Procurement Alerts.")
+
+# ─────────────────────────────────────────────────────────────
+# TAB 3: COMMODITY INSIGHTS
+# ─────────────────────────────────────────────────────────────
+with tab_commodity:
+    st.markdown('<div class="panel-header">📈 Commodity Market Intelligence</div>', unsafe_allow_html=True)
+    st.markdown("Live 90-day futures tracking and 30-day algorithmic forecasts for raw materials. (Source: Yahoo Finance)")
+    
+    with st.spinner("Fetching live market futures..."):
+        comm_data, comm_err = get_commodity_rates()
+    
+    if comm_err:
+        st.error(comm_err)
+    elif comm_data:
+        c1, c2 = st.columns(2)
+        cols = [c1, c2]
+        for idx, (commodity, data) in enumerate(comm_data.items()):
+            with cols[idx]:
+                st.markdown(f"### {commodity} (INR / KG)")
+                
+                st.metric("Current Rate", 
+                          f"₹{data['current_price']:.2f}",
+                          delta=data['trend'], 
+                          delta_color="normal" if "UP" in data['trend'] else "inverse" if "DOWN" in data['trend'] else "off")
+                
+                st.caption(f"30-Day High: ₹{data['high_30d']:.2f} | 30-Day Low: ₹{data['low_30d']:.2f}")
+                
+                 # Line chart historical
+                st.markdown("**Historical Price (90 Days)**")
+                hist_df = data['history']
+                st.line_chart(hist_df.set_index('Date')['Price_INR_KG'])
+                
+                st.markdown("**Algorithmic Forecast (Next 30 Days)**")
+                st.line_chart(data['forecast'])

@@ -1354,3 +1354,138 @@ def compute_material_requirements(predictions_df, bom_df, stock_summary_df):
 
     except Exception as e:
         return pd.DataFrame(), str(e)
+
+
+# ─────────────────────────────────────────────────────────────
+# COMMODITY RATE TRACKING (yfinance)
+# ─────────────────────────────────────────────────────────────
+def get_commodity_rates():
+    """
+    Fetch Copper (HG=F) and Aluminium (ALI=F) 90-day futures data.
+    Returns a dict with current price, 30d high, 30d low, trendline, and history df.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, "yfinance not installed. Please install it to view commodity rates."
+
+    tickers = {
+        'Copper': 'HG=F',     # High Grade Copper Futures (USD/lb)
+        'Aluminium': 'ALI=F'  # Aluminum Futures (USD/Tonne)
+    }
+
+    results = {}
+    try:
+        # Fetching live forex INR=X
+        usd_inr = yf.Ticker("INR=X").history(period="1d")['Close'].iloc[-1]
+    except Exception:
+        usd_inr = 83.5
+
+    import numpy as np
+    import pandas as pd
+
+    for name, ticker in tickers.items():
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="90d")
+            if hist.empty:
+                continue
+            
+            # Convert to INR / KG
+            if name == 'Copper':
+                # 1 lb = 0.453592 kg -> price per kg = price_per_lb / 0.453592
+                hist['Price_INR_KG'] = (hist['Close'] / 0.453592) * usd_inr
+            else:
+                # 1 Tonne = 1000 kg -> price per kg = price_per_tonne / 1000
+                hist['Price_INR_KG'] = (hist['Close'] / 1000) * usd_inr
+
+            current_price = hist['Price_INR_KG'].iloc[-1]
+            last_30d = hist.tail(30)['Price_INR_KG']
+            high_30d = last_30d.max()
+            low_30d = last_30d.min()
+
+            # Simple linear regression for 30-day forecast trend
+            y = hist['Price_INR_KG'].values
+            x = np.arange(len(y))
+            slope, intercept = np.polyfit(x, y, 1)
+            future_x = np.arange(len(y), len(y) + 30)
+            forecast = slope * future_x + intercept
+
+            # Calculate momentum (slope over last 14 days)
+            recent_y = hist['Price_INR_KG'].tail(14).values
+            recent_x = np.arange(len(recent_y))
+            recent_slope, _ = np.polyfit(recent_x, recent_y, 1)
+            trend_str = "UP ↗" if recent_slope > 0 else "DOWN ↘"
+            if abs(recent_slope) < 0.5: trend_str = "FLAT →"
+
+            results[name] = {
+                'current_price': current_price,
+                'high_30d': high_30d,
+                'low_30d': low_30d,
+                'trend': trend_str,
+                'history': hist[['Price_INR_KG']].reset_index(),
+                'forecast': forecast.tolist()
+            }
+        except Exception as e:
+            continue
+
+    if not results:
+        return None, "Failed to fetch commodity data from Yahoo Finance."
+    
+    return results, None
+
+
+# ─────────────────────────────────────────────────────────────
+# LOCAL DATA PERSISTENCE
+# ─────────────────────────────────────────────────────────────
+import os
+import shutil
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.data')
+
+def save_data(session_state):
+    """Save processed dataframes from session_state to local parquet files."""
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+
+    keys_to_save = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df']
+    saved_count = 0
+    for key in keys_to_save:
+        df = session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            path = os.path.join(DATA_DIR, f"{key}.parquet")
+            try:
+                # Convert object columns to string to avoid parquet errors with mixed types
+                save_df = df.copy()
+                for col in save_df.select_dtypes(include=['object']).columns:
+                    save_df[col] = save_df[col].astype(str)
+                save_df.to_parquet(path, index=False)
+                saved_count += 1
+            except Exception as e:
+                print(f"Error saving {key}: {e}")
+    return saved_count
+
+def load_data():
+    """Load dataframes from local parquet files. Returns a dict."""
+    if not os.path.exists(DATA_DIR):
+        return {}
+
+    loaded = {}
+    keys_to_load = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df']
+    for key in keys_to_load:
+        path = os.path.join(DATA_DIR, f"{key}.parquet")
+        if os.path.exists(path):
+            try:
+                loaded[key] = pd.read_parquet(path)
+            except Exception as e:
+                print(f"Error loading {key}: {e}")
+    return loaded
+
+def clear_data():
+    """Delete all local parquet files in the data directory."""
+    if not os.path.exists(DATA_DIR):
+        return
+    try:
+        shutil.rmtree(DATA_DIR)
+    except Exception as e:
+        print(f"Error clearing data: {e}")
