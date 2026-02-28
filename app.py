@@ -61,8 +61,8 @@ if 'processed' not in st.session_state:
 # ─────────────────────────────────────────────────────────────
 col_title, col_btn = st.columns([0.85, 0.15])
 with col_title:
-    st.markdown("# 🏭 Enterprise Inventory Intelligence")
-    st.markdown("*Predictive procurement & stock analytics for MSMEs — ERP grade*")
+    st.markdown("# 🏭 Smart Factory Operations")
+    st.markdown("*Precision Inventory & Material Tracking System*")
 with col_btn:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh Data", help="Reload data from cache and refresh views", use_container_width=True):
@@ -72,7 +72,7 @@ st.markdown("---")
 
 tab_dash, tab_bom, tab_commodity, tab_ingest = st.tabs([
     "📊 Executive Dashboard", 
-    "🧾 BOM & Procurement", 
+    "🧾 Material Requirements", 
     "📈 Commodity Insights",
     "⚙️ Data Ingestion"
 ])
@@ -81,7 +81,7 @@ tab_dash, tab_bom, tab_commodity, tab_ingest = st.tabs([
 # TAB 3: DATA INGESTION
 # ─────────────────────────────────────────────────────────────
 with tab_ingest:
-    st.markdown('<div class="panel-header">📥 Enterprise Data Ingestion</div>', unsafe_allow_html=True)
+    st.markdown('<div class="flex-header"><h2>📥 Enterprise Data Ingestion</h2></div>', unsafe_allow_html=True)
     st.markdown("Upload your Excel records to continuously update the intelligence engine.")
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -188,13 +188,15 @@ with tab_ingest:
                     stk, serr = compute_stock(combined)
                     if not serr:
                         st.session_state.stock_summary = stk
-                        out_df, oerr = material_outlook(
+                        out_df, locked_cap, oerr = material_outlook(
                             combined,
                             st.session_state.predictions_df,
-                            st.session_state.sales_df
+                            st.session_state.sales_df,
+                            st.session_state.get('purchase_df', None)
                         )
                         if not oerr:
                             st.session_state.outlook_df = out_df
+                            st.session_state.locked_capital = locked_cap
 
                 # -- BOM + Material Requirements --------------------
                 if bom_file:
@@ -249,26 +251,55 @@ with tab_dash:
     anchor_count     = len(anchor_df) if anchor_df is not None and not anchor_df.empty else 0
     total_materials  = stock_df['material'].nunique() if stock_df is not None and not stock_df.empty else 0
     pred_count       = len(predictions) if predictions is not None and not predictions.empty else 0
+    locked_cap_val   = st.session_state.get('locked_capital', 0.0)
 
     # Replace raw HTML with native UI columns for proper margins
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Active Customers", total_customers)
     k2.metric("Anchor Clients", anchor_count)
     k3.metric("SKUs Tracked", total_materials)
     k4.metric("Expected Reorders", pred_count)
+    if locked_cap_val > 0:
+        k5.markdown(f'<div data-testid="stMetric" style="border-left: 4px solid #F57C00;"><div data-testid="stMetricLabel">Working Capital Locked</div><div data-testid="stMetricValue">₹{locked_cap_val:,.0f}</div></div>', unsafe_allow_html=True)
+    else:
+        k5.metric("Working Capital Locked", f"₹{locked_cap_val:,.0f}")
+        
     st.markdown("---")
+    
+    if locked_cap_val > 0:
+        with st.expander("View Excess Inventory Breakdown (Working Capital Lock)"):
+            if outlook_df is not None and not outlook_df.empty:
+                excess_df = outlook_df[outlook_df['locked_capital'] > 0]
+                if not excess_df.empty:
+                    st.dataframe(
+                        excess_df[['Material', 'excess_stock', 'locked_capital']]
+                        .sort_values('locked_capital', ascending=False)
+                        .assign(**{"SR. NO.": range(1, len(excess_df)+1)}).set_index("SR. NO.")
+                        .style.format({'locked_capital': '₹{:,.2f}'}),
+                        use_container_width=True
+                    )
     
     
     # -- DASH SECTION 1 --
     with st.container():
-        st.markdown('<div class="panel-header">📊 Sales Intelligence</div>', unsafe_allow_html=True)
+        st.markdown('<div class="flex-header"><h2>📊 Sales Intelligence</h2></div>', unsafe_allow_html=True)
         if sales_df is not None and not sales_df.empty:
             if 'date' in sales_df.columns and 'quantity' in sales_df.columns:
                 trend_df = sales_df.dropna(subset=['date', 'quantity'])
                 if not trend_df.empty:
                     st.markdown("**Sales Volume Trend**")
                     daily = trend_df.groupby('date')['quantity'].sum().reset_index()
-                    st.bar_chart(daily.set_index('date'))
+                    import altair as alt
+                    chart = alt.Chart(daily).mark_line(
+                        point=alt.OverlayMarkDef(filled=False, fill="white", color="#0B3D91", size=60),
+                        color="#0B3D91",
+                        strokeWidth=2
+                    ).encode(
+                        x=alt.X('date:T', title='', axis=alt.Axis(grid=False, format='%b %d')),
+                        y=alt.Y('quantity:Q', title='Volume', axis=alt.Axis(gridColor='#f1f5f9')),
+                        tooltip=[alt.Tooltip('date:T', title='Date'), alt.Tooltip('quantity:Q', title='Volume sold')]
+                    ).properties(height=250)
+                    st.altair_chart(chart, use_container_width=True)
 
             if anchor_df is not None and not anchor_df.empty:
                 st.markdown("**Core Revenue Drivers (Anchor Clients)**")
@@ -278,14 +309,26 @@ with tab_dash:
                     use_container_width=True, height=220
                 )
             if predictions is not None and not predictions.empty:
-                st.markdown("**Predicted Reorder Pipeline**")
+                st.markdown("**Predicted Reorder Pipeline & Volatility**")
+                if 'volatility_label' not in predictions.columns:
+                    predictions['volatility_label'] = 'Pending Order Data'
+
                 def _conf_color(val):
-                    if val >= 70: return 'color: #2e7d32; font-weight:bold'
-                    elif val >= 40: return 'color: #e65100'
-                    return 'color: #c62828'
+                    if pd.isna(val) or type(val) == str: return ''
+                    if val >= 70: return 'background-color: #bbf7d0; color: #166534; font-weight:700' # light emerald
+                    elif val >= 40: return 'background-color: #fef08a; color: #854d0e; font-weight:700' # light yellow
+                    return 'background-color: #fecaca; color: #991b1b; font-weight:700' # light red
+                    
+                def _vol_color(val):
+                    if val == "Stable": return 'color: #166534; font-weight:700'
+                    elif val == "Moderate": return 'color: #854d0e; font-weight:700'
+                    elif val == "Unstable": return 'color: #991b1b; font-weight:700'
+                    return 'color: #9ca3af'
+
                 st.dataframe(
                     predictions.assign(**{"SR. NO.": range(1, len(predictions)+1)}).set_index("SR. NO.")
-                    .style.applymap(_conf_color, subset=['Confidence %']),
+                    .style.applymap(_conf_color, subset=['Confidence %'])
+                    .applymap(_vol_color, subset=['volatility_label']),
                     use_container_width=True, height=260
                 )
             else:
@@ -295,21 +338,31 @@ with tab_dash:
 
     # -- DASH SECTION 2 --
     with st.container():
-        st.markdown('<div class="panel-header">📦 Stock Position</div>', unsafe_allow_html=True)
+        st.markdown('<div class="flex-header"><h2>📦 Stock Position</h2></div>', unsafe_allow_html=True)
         if stock_sum is not None and not stock_sum.empty:
             low = stock_sum[stock_sum['Low Stock'] == True]
             if len(low) > 0:
                 st.markdown(f'<div class="warning-box">⚠ <b>{len(low)} material(s)</b> are critically low (<20% of inward).</div>', unsafe_allow_html=True)
             
-            st.markdown("**Raw Material Stock Movement**")
+            st.markdown("**Raw Material Stock Movement & Coverage**")
+            if 'coverage_label' not in stock_sum.columns:
+                stock_sum['coverage_label'] = 'No Recent Movement'
+
             def _highlight_low(row):
-                style = 'background-color: #fdf5f6; color: #842029' if row['Low Stock'] else ''
+                style = 'background-color: #fca5a5; color: #991b1b; font-weight:700' if row['Low Stock'] else ''
                 return [style] * len(row)
+                
+            def _cov_color(val):
+                if val == "Critical": return 'background-color: #fca5a5; color: #991b1b; font-weight:700'
+                elif val == "Moderate": return 'background-color: #fde68a; color: #92400e; font-weight:700'
+                elif val == "Healthy": return 'background-color: #bbf7d0; color: #166534; font-weight:700'
+                return ''
+
             try:
+                disp_stock = stock_sum.drop(columns=['Low Stock']).assign(**{"SR. NO.": range(1, len(stock_sum)+1)}).set_index("SR. NO.")
                 st.dataframe(
-                    stock_sum.drop(columns=['Low Stock'])
-                    .assign(**{"SR. NO.": range(1, len(stock_sum)+1)}).set_index("SR. NO.")
-                    .style.apply(_highlight_low, axis=1),
+                    disp_stock.style.apply(_highlight_low, axis=1)
+                    .applymap(_cov_color, subset=['coverage_label']),
                     use_container_width=True, height=360
                 )
             except Exception:
@@ -319,13 +372,13 @@ with tab_dash:
 
     # -- DASH SECTION 3 --
     with st.container():
-        st.markdown('<div class="panel-header">🔮 Ad-Hoc Supply Outlook</div>', unsafe_allow_html=True)
+        st.markdown('<div class="flex-header"><h2>🔮 Ad-Hoc Supply Outlook</h2></div>', unsafe_allow_html=True)
         if outlook_df is not None and not outlook_df.empty:
             st.markdown("**Material Depletion Advisory**")
             def _advisory_style(val):
-                if val == 'Buy Soon': return 'background-color: #f8d7da; color:#842029; font-weight:bold'
-                if val == 'Prepare':  return 'background-color: #fff3cd; color:#664d03; font-weight:bold'
-                return 'background-color: #d1e6dd; color:#0f5132'
+                if val == 'Buy Soon': return 'background-color: #fca5a5; color: #991b1b; font-weight:700'
+                if val == 'Prepare':  return 'background-color: #fde68a; color: #92400e; font-weight:700'
+                return 'background-color: #bbf7d0; color: #166534'
             st.dataframe(
                 outlook_df.assign(**{"SR. NO.": range(1, len(outlook_df)+1)}).set_index("SR. NO.")
                 .style.applymap(_advisory_style, subset=['Advisory'])
@@ -335,9 +388,9 @@ with tab_dash:
         else:
             st.info("Awaiting combined stock and sales data.")
 
-    # -- DASH SECTION 4: BOM ENGINE --
-    st.markdown('<br><div class="panel-header">🧾 BOM-Driven Procurement Engine</div>', unsafe_allow_html=True)
-    st.markdown("Automated raw material demand planning driven by predicted customer orders.")
+    # -- DASH SECTION 4: SMART REQUIREMENT ENGINE --
+    st.markdown('<br><div class="flex-header"><h2>🧾 Smart Material Planning</h2></div>', unsafe_allow_html=True)
+    st.markdown("Automated raw material demand planning based on upcoming customer orders.")
     
     requirements_df = st.session_state.get('requirements_df')
     bom_df          = st.session_state.get('bom_df')
@@ -349,17 +402,17 @@ with tab_dash:
 
         with col_kpi1:
             if buy_now_count > 0:
-                st.markdown(f'<div class="warning-box" style="background-color:#f8d7da; border-color:#f5c2c7; color:#842029; padding:16px;">🚨 <b>ACTION REQUIRED:</b> {buy_now_count} materials must be procured immediately to meet predicted orders.</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="warning-box status-crit">🚨 <b>ACTION REQUIRED:</b> {buy_now_count} materials must be procured immediately to meet predicted orders.</div>', unsafe_allow_html=True)
             elif prepare_count > 0:
-                st.markdown(f'<div class="warning-box" style="padding:16px;">⚠️ <b>HEADS UP:</b> {prepare_count} materials are approaching low-stock against predicted orders.</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="warning-box status-warn">⚠️ <b>HEADS UP:</b> {prepare_count} materials are approaching low-stock against predicted orders.</div>', unsafe_allow_html=True)
             else:
-                st.markdown('<div class="warning-box" style="background-color:#d1e6dd; border-color:#badbcc; color:#0f5132; padding:16px;">✅ <b>STOCK HEALTHY:</b> All materials sufficient for predicted upcoming orders.</div>', unsafe_allow_html=True)
+                st.markdown('<div class="warning-box status-ok">✅ <b>STOCK HEALTHY:</b> All materials sufficient for predicted upcoming orders.</div>', unsafe_allow_html=True)
 
         def _req_style(val):
-            if val == 'BUY NOW':   return 'background-color:#FF3B30; color:white; font-weight:bold'
-            if val == 'PREPARE':   return 'background-color:#FF9500; color:white; font-weight:bold'
-            if val == 'CHECK STOCK': return 'background-color:#FFD60A; color:black; font-weight:bold'
-            if val == 'OK':        return 'background-color:#34C759; color:white; font-weight:bold'
+            if val == 'BUY NOW':   return 'background-color: #fca5a5; color:#fff; font-weight:700'
+            if val == 'PREPARE':   return 'background-color: #fde68a; color:#b45309; font-weight:700'
+            if val == 'CHECK STOCK': return 'background-color: #bfdbfe; color:#1d4ed8; font-weight:700'
+            if val == 'OK':        return 'background-color: #bbf7d0; color:#15803d; font-weight:700'
             return ''
 
         try:
@@ -381,7 +434,7 @@ with tab_dash:
 # TAB 2: BOM RAW MAPPING
 # ─────────────────────────────────────────────────────────────
 with tab_bom:
-    st.markdown('<div class="panel-header">📋 Uploaded Bill of Materials</div>', unsafe_allow_html=True)
+    st.markdown('<div class="flex-header"><h2>📋 Uploaded Bill of Materials</h2></div>', unsafe_allow_html=True)
     
     _bom = st.session_state.get('bom_df')
     if _bom is not None and not _bom.empty:
@@ -396,7 +449,7 @@ with tab_bom:
 # TAB 3: COMMODITY INSIGHTS
 # ─────────────────────────────────────────────────────────────
 with tab_commodity:
-    st.markdown('<div class="panel-header">📈 Commodity Market Intelligence</div>', unsafe_allow_html=True)
+    st.markdown('<div class="flex-header"><h2>📈 Commodity Market Intelligence</h2></div>', unsafe_allow_html=True)
     st.markdown("Live 90-day futures tracking and 30-day algorithmic forecasts for raw materials. (Source: Yahoo Finance)")
     
     with st.spinner("Fetching live market futures..."):

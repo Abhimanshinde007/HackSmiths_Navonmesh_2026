@@ -9,6 +9,16 @@ import pandas as pd
 import numpy as np
 
 
+# -----------------------------------------------------------------
+# EXPORTS
+# -----------------------------------------------------------------
+__all__ = [
+    'ingest_sales_excel', 'ingest_purchase_excel', 'ingest_inward_excel', 'ingest_outward_excel',
+    'combine_stock_registers', 'get_anchor_customers', 'predict_reorder', 'compute_stock', 'material_outlook',
+    'ingest_bom_excel', 'compute_material_requirements', 'compute_product_costs', 'load_data', 'save_data', 'clear_data', 'get_commodity_rates'
+]
+
+
 # ─────────────────────────────────────────────────────────────
 # TALLY VISUAL EXCEL INVOICE PARSER
 # These are PDF-converted XLS files with NO tabular headers.
@@ -881,8 +891,19 @@ def predict_reorder(sales_df, anchor_df):
 
             if mu == 0:
                 confidence = 0.0
+                vol_idx = None
+                vol_label = "Pending Order Data"
             else:
                 confidence = max(0.0, round(100 - (sigma / mu * 100), 1)) if not pd.isna(sigma) else 50.0
+                vol_idx = sigma / mu if not pd.isna(sigma) else None
+                if vol_idx is None:
+                    vol_label = "Pending Order Data"
+                elif vol_idx < 0.3:
+                    vol_label = "Stable"
+                elif vol_idx < 0.6:
+                    vol_label = "Moderate"
+                else:
+                    vol_label = "Unstable"
 
             early = predicted - pd.Timedelta(days=round(half_sig))
             late  = predicted + pd.Timedelta(days=round(half_sig))
@@ -894,9 +915,16 @@ def predict_reorder(sales_df, anchor_df):
                 'Predicted Next Order': predicted.strftime('%d %b %Y'),
                 'Window':               f"{early.strftime('%d %b')} – {late.strftime('%d %b %Y')}",
                 'Confidence %':         confidence,
+                'volatility_index':     round(vol_idx, 2) if vol_idx is not None else None,
+                'volatility_label':     vol_label,
             })
         if not results:
-            return pd.DataFrame(), "Not enough order history (need ≥2 dates per customer)."
+            empty_df = pd.DataFrame(columns=[
+                'Customer', 'Last Order', 'Avg Interval (Days)', 
+                'Predicted Next Order', 'Window', 'Confidence %',
+                'volatility_index', 'volatility_label'
+            ])
+            return empty_df, "Not enough order history (need ≥2 dates per customer)."
         return pd.DataFrame(results), None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -1103,9 +1131,10 @@ def combine_stock_registers(inward_df, outward_df):
     """
     parts = []
     if inward_df is not None and not inward_df.empty:
-        parts.append(inward_df[['material', 'inward', 'outward']])
+        # Keep all available columns to preserve 'date'
+        parts.append(inward_df)
     if outward_df is not None and not outward_df.empty:
-        parts.append(outward_df[['material', 'inward', 'outward']])
+        parts.append(outward_df)
     if not parts:
         return pd.DataFrame()
     return pd.concat(parts, ignore_index=True)
@@ -1119,40 +1148,85 @@ def compute_stock(stock_df):
     try:
         if stock_df is None or stock_df.empty:
             return pd.DataFrame(), "No stock data."
+        
+        # Calculate recent average daily consumption (last 30 days)
+        recent_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        if 'date' in stock_df.columns:
+            recent_outward = stock_df[(stock_df['date'] >= recent_cutoff) & (stock_df['outward'] > 0)]
+            recent_agg = recent_outward.groupby('material')['outward'].sum().reset_index()
+            recent_agg.rename(columns={'outward': 'last_30d_outward'}, inplace=True)
+        else:
+            recent_agg = pd.DataFrame(columns=['material', 'last_30d_outward'])
+
         agg = (stock_df.groupby('material')
                .agg(total_inward=('inward', 'sum'),
                     total_outward=('outward', 'sum'))
                .reset_index())
+               
+        agg = pd.merge(agg, recent_agg, on='material', how='left')
+        agg['last_30d_outward'] = agg['last_30d_outward'].fillna(0)
+        
         agg['current_stock'] = agg['total_inward'] - agg['total_outward']
         agg['low_stock'] = agg['current_stock'] < (agg['total_inward'] * 0.2)
-        agg.columns = ['Material', 'Total Inward', 'Total Outward', 'Current Stock', 'Low Stock']
-        return agg.sort_values('Current Stock').reset_index(drop=True), None
+        
+        # Coverage days
+        agg['avg_daily_consumption'] = agg['last_30d_outward'] / 30.0
+        
+        def _get_coverage(row):
+            adc = row['avg_daily_consumption']
+            cstk = row['current_stock']
+            if adc <= 0:
+                return None
+            return cstk / adc
+            
+        def _get_cov_label(val):
+            if val is None or pd.isna(val): return "No Recent Movement"
+            if val < 7: return "Critical"
+            if val < 21: return "Moderate"
+            return "Healthy"
+
+        agg['coverage_days'] = agg.apply(_get_coverage, axis=1)
+        agg['coverage_label'] = agg['coverage_days'].apply(_get_cov_label)
+
+        agg.columns = ['Material', 'Total Inward', 'Total Outward', 'last_30d_outward', 'Current Stock', 'Low Stock', 'avg_daily_consumption', 'coverage_days', 'coverage_label']
+        out_cols = ['Material', 'Total Inward', 'Total Outward', 'Current Stock', 'Low Stock', 'coverage_days', 'coverage_label']
+        return agg[out_cols].sort_values('Current Stock').reset_index(drop=True), None
     except Exception as e:
         return pd.DataFrame(), str(e)
 
 
 
 
-def material_outlook(stock_df, predictions_df, sales_df):
+def material_outlook(stock_df, predictions_df, sales_df, purchase_df=None):
     """
-    Compare predicted demand vs current stock.
-    Returns (df, error).
+    Compare predicted demand vs current stock. Computes Locked Working Capital.
+    Returns (df, total_locked_capital, error).
     """
     try:
         if stock_df is None or stock_df.empty:
-            return pd.DataFrame(), "No stock data for outlook."
+            return pd.DataFrame(), 0.0, "No stock data for outlook."
 
         stock_agg, _ = compute_stock(stock_df)
         if stock_agg is None or stock_agg.empty:
-            return pd.DataFrame(), "No stock after aggregation."
+            return pd.DataFrame(), 0.0, "No stock after aggregation."
 
-        # Get avg monthly outward per material
+        # Find latest purchase rate per material for capital lock
+        latest_rates = {}
+        if purchase_df is not None and not purchase_df.empty and 'date' in purchase_df.columns and 'rate' in purchase_df.columns:
+            recent_purchases = purchase_df.sort_values('date', ascending=False)
+            for _, r in recent_purchases.iterrows():
+                mat_key = str(r.get('material', '')).lower().strip()
+                if mat_key not in latest_rates:
+                    rate = pd.to_numeric(r.get('rate', 0), errors='coerce')
+                    if not pd.isna(rate):
+                        latest_rates[mat_key] = rate
+
         rows = []
         for _, srow in stock_agg.iterrows():
             mat   = srow['Material']
             c_stk = srow['Current Stock']
 
-            # Estimate demand from sales data product column (fuzzy match on material name)
+            # Estimate demand from sales data product column
             demand_est = 0.0
             if sales_df is not None and not sales_df.empty and 'product' in sales_df.columns:
                 mask = sales_df['product'].str.lower().str.contains(
@@ -1160,9 +1234,9 @@ def material_outlook(stock_df, predictions_df, sales_df):
                 )
                 demand_est = float(sales_df.loc[mask, 'quantity'].sum())
 
+            # Status flag
+            status = 'Monitor'
             if predictions_df is not None and not predictions_df.empty:
-                # Simple: if any prediction is within 30 days, treat demand as urgent
-                status = 'Monitor'
                 if demand_est > c_stk and c_stk >= 0:
                     status = 'Buy Soon'
                 elif demand_est > c_stk * 0.7:
@@ -1172,23 +1246,38 @@ def material_outlook(stock_df, predictions_df, sales_df):
                     status = 'Buy Soon'
                 elif srow['Low Stock']:
                     status = 'Prepare'
-                else:
-                    status = 'Monitor'
+
+            # Working Capital Lock Calculation
+            excess_stock = max(0.0, c_stk - demand_est)
+            mat_key_lower = mat.lower().strip()
+            rate = 0.0
+            for k, v in latest_rates.items():
+                if mat_key_lower[:8] in k or k[:8] in mat_key_lower:
+                    rate = v
+                    break
+            
+            locked_capital = excess_stock * rate if excess_stock > 0 else 0.0
 
             rows.append({
                 'Material':       mat,
                 'Current Stock':  round(c_stk, 1),
                 'Est. Demand':    round(demand_est, 1),
                 'Advisory':       status,
+                'excess_stock':   round(excess_stock, 1),
+                'locked_capital': round(locked_capital, 2)
             })
+            
         out_df = pd.DataFrame(rows)
+        total_locked = 0.0
         if not out_df.empty:
+            total_locked = out_df['locked_capital'].sum()
             severity_map = {'Buy Soon': 1, 'Prepare': 2, 'Monitor': 3}
             out_df['Severity'] = out_df['Advisory'].map(severity_map)
             out_df = out_df.sort_values(by=['Severity', 'Est. Demand'], ascending=[True, False]).drop(columns=['Severity'])
-        return out_df, None
+            
+        return out_df, total_locked, None
     except Exception as e:
-        return pd.DataFrame(), str(e)# -----------------------------------------------------------------
+        return pd.DataFrame(), 0.0, str(e)# -----------------------------------------------------------------
 # 4. BILL OF MATERIALS (BOM) INGESTION & REQUIREMENTS ENGINE
 # Format: Product Name | Copper Type | Copper Weight |
 #         Lamination Type | Lamination Weight | Bobbin Type | Other Reqs
@@ -1406,6 +1495,83 @@ def compute_material_requirements(predictions_df, bom_df, stock_summary_df):
         return pd.DataFrame(), str(e)
 
 
+# -----------------------------------------------------------------
+# 5. PRODUCT COST COMPUTATION
+# -----------------------------------------------------------------
+def compute_product_costs(bom_df, purchase_df):
+    """
+    Calculate the estimated cost per product based on BOM material requirements
+    and the latest purchase price for those materials.
+    
+    Returns (cost_df, error)
+    """
+    try:
+        if bom_df is None or bom_df.empty:
+            return pd.DataFrame(), "No BOM data available for cost calculation."
+        if purchase_df is None or purchase_df.empty:
+            return pd.DataFrame(), "No Purchase data available for material pricing."
+
+        # Get latest purchase price for each material
+        # We sort by date, then group by material to keep the last (most recent) rate.
+        latest_prices = purchase_df.sort_values('date').dropna(subset=['rate']).groupby('material').last()[['rate']].reset_index()
+        
+        # Build a simple dictionary lookup for fuzzy matching
+        price_dict = {str(row['material']).lower(): float(row['rate']) for _, row in latest_prices.iterrows()}
+
+        def _get_price(material_keyword):
+            if not material_keyword:
+                return 0.0
+            mk = str(material_keyword).lower()
+            # Direct match
+            if mk in price_dict:
+                return price_dict[mk]
+            # Fuzzy match
+            for k, v in price_dict.items():
+                if mk in k or k in mk:
+                    return v
+            return 0.0
+
+        results = []
+        for _, row in bom_df.iterrows():
+            product = row.get('product', 'Unknown')
+            
+            # Copper
+            cu_type = str(row.get('copper_type', ''))
+            cu_wt = float(row.get('copper_weight_kg', 0) or 0)
+            cu_rate = _get_price(cu_type) if cu_type else _get_price("copper")
+            cu_cost = round(cu_wt * cu_rate, 2)
+
+            # Lamination
+            lam_type = str(row.get('lamination_type', ''))
+            lam_wt = float(row.get('lamination_weight_kg', 0) or 0)
+            lam_rate = _get_price(lam_type) if lam_type else _get_price("lamination")
+            lam_cost = round(lam_wt * lam_rate, 2)
+
+            # Bobbin (assume 1 unit per product generally, or find weight)
+            bob_type = str(row.get('bobbin_type', ''))
+            bob_rate = _get_price(bob_type) if bob_type else _get_price("bobbin")
+            bob_cost = round(1.0 * bob_rate, 2) # Assume 1 unit per product
+
+            total_cost = cu_cost + lam_cost + bob_cost
+
+            results.append({
+                'Product': product,
+                'Copper Cost (₹)': cu_cost,
+                'Lamination Cost (₹)': lam_cost,
+                'Bobbin Cost (₹)': bob_cost,
+                'Total Material Cost (₹)': total_cost
+            })
+
+        if not results:
+            return pd.DataFrame(), "Failed to calculate costs for products."
+
+        result_df = pd.DataFrame(results)
+        return result_df.sort_values('Total Material Cost (₹)', ascending=False).reset_index(drop=True), None
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
 # ─────────────────────────────────────────────────────────────
 # COMMODITY RATE TRACKING (yfinance)
 # ─────────────────────────────────────────────────────────────
@@ -1498,7 +1664,7 @@ def save_data(session_state):
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-    keys_to_save = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df']
+    keys_to_save = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df', 'product_costs_df']
     saved_count = 0
     for key in keys_to_save:
         df = session_state.get(key)
@@ -1521,7 +1687,7 @@ def load_data():
         return {}
 
     loaded = {}
-    keys_to_load = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df']
+    keys_to_load = ['sales_df', 'purchase_df', 'stock_df', 'bom_df', 'predictions_df', 'stock_summary', 'outlook_df', 'anchor_df', 'requirements_df', 'product_costs_df']
     for key in keys_to_load:
         path = os.path.join(DATA_DIR, f"{key}.parquet")
         if os.path.exists(path):
