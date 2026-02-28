@@ -15,7 +15,8 @@ import numpy as np
 __all__ = [
     'ingest_sales_excel', 'ingest_purchase_excel', 'ingest_inward_excel', 'ingest_outward_excel',
     'combine_stock_registers', 'get_anchor_customers', 'predict_reorder', 'compute_stock', 'material_outlook',
-    'ingest_bom_excel', 'compute_material_requirements', 'compute_product_costs', 'load_data', 'save_data', 'clear_data', 'get_commodity_rates'
+    'ingest_bom_excel', 'compute_material_requirements', 'compute_product_costs', 'load_data', 'save_data', 'clear_data', 'get_commodity_rates',
+    'load_company', 'save_company'
 ]
 
 
@@ -1705,3 +1706,24 @@ def clear_data():
         shutil.rmtree(DATA_DIR)
     except Exception as e:
         print(f"Error clearing data: {e}")
+
+def save_company(company_name):
+    """Save the user's company name locally."""
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    try:
+        with open(os.path.join(DATA_DIR, 'company.txt'), 'w', encoding='utf-8') as f:
+            f.write(company_name.strip())
+    except Exception as e:
+        print(f"Error saving company name: {e}")
+
+def load_company():
+    """Load the user's company name from local cache."""
+    try:
+        path = os.path.join(DATA_DIR, 'company.txt')
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return None

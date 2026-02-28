@@ -16,7 +16,9 @@ from utils.data_processor import (
     load_data,
     save_data,
     clear_data,
-    get_commodity_rates
+    get_commodity_rates,
+    load_company,
+    save_company
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -30,10 +32,25 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────
-# STYLING
+# STYLING & THEME TOGGLE LOGIC
 # ─────────────────────────────────────────────────────────────
+import os
+CONFIG_FILE = ".streamlit/config.toml"
+
+def get_current_theme():
+    if not os.path.exists(CONFIG_FILE):
+        return "light"
+    with open(CONFIG_FILE, "r") as f:
+        content = f.read()
+        if 'base="dark"' in content or "base = 'dark'" in content:
+            return "dark"
+    return "light"
+
+current_theme = get_current_theme()
+css_file = "style_dark.css" if current_theme == "dark" else "style_light.css"
+
 try:
-    with open("style.css") as f:
+    with open(css_file) as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 except Exception:
     pass
@@ -41,7 +58,7 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 # SESSION STATE & PERSISTENCE
 # ─────────────────────────────────────────────────────────────
-# Attempt to load saved data first
+# Load from disk to ensure data survives a page reload (F5)
 loaded = load_data() if 'loaded_once' not in st.session_state else {}
 st.session_state.loaded_once = True
 
@@ -52,35 +69,113 @@ for key in ['sales_df', 'purchase_df', 'stock_df',
         st.session_state[key] = loaded.get(key, None)
 
 if 'processed' not in st.session_state:
-    # If we successfully loaded sales or stock, flag as processed
     st.session_state.processed = (loaded.get('sales_df') is not None) or (loaded.get('stock_df') is not None)
 
 
 # ─────────────────────────────────────────────────────────────
-# HEADER
+# HEADER & THEME TOGGLE
 # ─────────────────────────────────────────────────────────────
-col_title, col_btn = st.columns([0.85, 0.15])
+
+def toggle_theme():
+    new_base = "dark" if current_theme == "light" else "light"
+    new_primary = "#6366f1" if new_base == "dark" else "#0B3D91"
+    new_bg = "#0b1121" if new_base == "dark" else "#f4f6f9"
+    new_sec_bg = "#1e293b" if new_base == "dark" else "#ffffff"
+    new_text = "#e2e8f0" if new_base == "dark" else "#333333"
+
+    new_content = f"""[theme]
+base="{new_base}"
+primaryColor = "{new_primary}"
+backgroundColor = "{new_bg}"
+secondaryBackgroundColor = "{new_sec_bg}"
+textColor = "{new_text}"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+"""
+    os.makedirs(".streamlit", exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        f.write(new_content)
+    
+    # Force streamlit to recognize the new config immediately via internal API
+    try:
+        st._config.set_option('theme.base', new_base)
+        st._config.set_option('theme.primaryColor', new_primary)
+        st._config.set_option('theme.backgroundColor', new_bg)
+        st._config.set_option('theme.secondaryBackgroundColor', new_sec_bg)
+        st._config.set_option('theme.textColor', new_text)
+    except Exception:
+        pass
+        
+    st.rerun()
+
+col_title, col_btn1, col_btn2 = st.columns([0.75, 0.12, 0.13])
+
+# ─────────────────────────────────────────────────────────────
+# COMPANY ONBOARDING & HEADER
+# ─────────────────────────────────────────────────────────────
+company_name = load_company()
+if company_name:
+    st.session_state.company_name = company_name
+
+if not st.session_state.get('company_name'):
+    st.markdown("<br><br><h1 style='text-align: center;'>Welcome to Smart Factory Operations</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #64748b;'>Please configure your workspace to continue.</p><br>", unsafe_allow_html=True)
+    
+    col_a, col_b, col_c = st.columns([1,2,1])
+    with col_b:
+        with st.form("onboarding_form"):
+            c_name = st.text_input("Enter Company Name", placeholder="e.g. Acme Industries Ltd.")
+            submitted = st.form_submit_button("Launch Dashboard", use_container_width=True)
+            if submitted and c_name.strip():
+                save_company(c_name.strip())
+                st.session_state.company_name = c_name.strip()
+                st.rerun()
+    st.stop()
+
 with col_title:
-    st.markdown("# 🏭 Smart Factory Operations")
+    st.markdown(f"# 🏭 {st.session_state.company_name} | Smart Factory Operations")
     st.markdown("*Precision Inventory & Material Tracking System*")
-with col_btn:
+with col_btn1:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if current_theme == "light":
+        if st.button("🌙 Dark Mode", use_container_width=True):
+            toggle_theme()
+    else:
+        if st.button("☀️ Light Mode", use_container_width=True):
+            toggle_theme()
+            
+with col_btn2:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh Data", help="Reload data from cache and refresh views", use_container_width=True):
         st.session_state.loaded_once = False
         st.rerun()
 st.markdown("---")
 
-tab_dash, tab_bom, tab_commodity, tab_ingest = st.tabs([
-    "📊 Executive Dashboard", 
-    "🧾 Material Requirements", 
-    "📈 Commodity Insights",
-    "⚙️ Data Ingestion"
-])
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR NAVIGATION
+# ─────────────────────────────────────────────────────────────
+if 'active_tab' not in st.session_state:
+    st.session_state.active_tab = "Executive Dashboard" if st.session_state.processed else "Data Ingestion"
+
+st.sidebar.markdown(f"**{st.session_state.company_name}**")
+st.sidebar.markdown("---")
+selected_tab = st.sidebar.radio("Navigation", [
+    "Data Ingestion",
+    "Executive Dashboard", 
+    "Material Requirements", 
+    "Commodity Insights"
+], index=["Data Ingestion", "Executive Dashboard", "Material Requirements", "Commodity Insights"].index(st.session_state.active_tab))
+
+if selected_tab != st.session_state.active_tab:
+    st.session_state.active_tab = selected_tab
+    st.rerun()
 
 # ─────────────────────────────────────────────────────────────
-# TAB 3: DATA INGESTION
+# TAB: DATA INGESTION
 # ─────────────────────────────────────────────────────────────
-with tab_ingest:
+if st.session_state.active_tab == "Data Ingestion":
     st.markdown('<div class="flex-header"><h2>📥 Enterprise Data Ingestion</h2></div>', unsafe_allow_html=True)
     st.markdown("Upload your Excel records to continuously update the intelligence engine.")
     st.markdown("<br>", unsafe_allow_html=True)
@@ -117,11 +212,15 @@ with tab_ingest:
         
         
         if st.button("🔄 Reset All Data", help="Clear all stored data and refresh app", use_container_width=True):
-            clear_data()
-            for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
-                st.session_state[key] = None
-            st.session_state.processed = False
-            st.session_state.loaded_once = False
+            with st.spinner("Purging database & resetting workspace..."):
+                import time
+                time.sleep(1.5) # Simulate database purge for visual feedback
+                clear_data()
+                for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
+                    st.session_state[key] = None
+                st.session_state.processed = False
+                st.session_state.loaded_once = False
+                st.session_state.company_name = None
             st.rerun()
             
     # -- Display Persisted Logs --
@@ -221,23 +320,65 @@ with tab_ingest:
                         if not req_err:
                             st.session_state.requirements_df = req_df
                 
-                # Persist to local disk
-                saved_count = save_data(st.session_state)
-                if saved_count > 0:
-                    new_logs.append(('success', f"💾 Securely cached {saved_count} datasets locally for persistence."))
+                # Persist to local disk cache for internal fast compute (but wiped on reload)
+                save_data(st.session_state)
 
                 st.session_state.process_logs = new_logs
                 st.session_state.processed = True
+                st.session_state.active_tab = "Executive Dashboard"
             st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
 # TAB 1: EXECUTIVE DASHBOARD
 # ─────────────────────────────────────────────────────────────
-with tab_dash:
+elif st.session_state.active_tab == "Executive Dashboard":
     if not st.session_state.processed:
-        st.info("ℹ️ Your dashboard is empty. Please navigate to the **⚙️ Data Ingestion** tab to upload your records.")
         st.stop()
+
+    # -- DASH SECTION 4: SMART REQUIREMENT ENGINE (MOVED TO TOP) --
+    st.markdown('<div class="flex-header"><h2>🧾 Smart Material Planning</h2></div>', unsafe_allow_html=True)
+    st.markdown("Automated raw material demand planning based on upcoming customer orders.")
+    
+    requirements_df = st.session_state.get('requirements_df')
+    bom_df          = st.session_state.get('bom_df')
+
+    if requirements_df is not None and not requirements_df.empty:
+        col_kpi1, col_kpi2 = st.columns(2)
+        buy_now_count = len(requirements_df[requirements_df['Status'] == 'BUY NOW'])
+        prepare_count = len(requirements_df[requirements_df['Status'] == 'PREPARE'])
+
+        with col_kpi1:
+            if buy_now_count > 0:
+                st.markdown(f'<div class="warning-box status-crit">🚨 <b>ACTION REQUIRED:</b> {buy_now_count} materials must be procured immediately to meet predicted orders.</div>', unsafe_allow_html=True)
+            elif prepare_count > 0:
+                st.markdown(f'<div class="warning-box status-warn">⚠️ <b>HEADS UP:</b> {prepare_count} materials are approaching low-stock against predicted orders.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="warning-box status-ok">✅ <b>STOCK HEALTHY:</b> All materials sufficient for predicted upcoming orders.</div>', unsafe_allow_html=True)
+
+        def _req_style(val):
+            if val == 'BUY NOW':   return 'background-color: #fca5a5; color:#fff; font-weight:700'
+            if val == 'PREPARE':   return 'background-color: #fde68a; color:#b45309; font-weight:700'
+            if val == 'CHECK STOCK': return 'background-color: #bfdbfe; color:#1d4ed8; font-weight:700'
+            if val == 'OK':        return 'background-color: #bbf7d0; color:#15803d; font-weight:700'
+            return ''
+
+        try:
+            st.dataframe(
+                requirements_df.assign(**{"SR. NO.": range(1, len(requirements_df)+1)}).set_index("SR. NO.")
+                .style.applymap(_req_style, subset=['Status']),
+                use_container_width=True,
+                height=500
+            )
+        except Exception:
+            st.dataframe(requirements_df, use_container_width=True, height=500)
+
+    elif bom_df is not None and not bom_df.empty:
+        st.info("Upload Sales Bills to generate reorder predictions and compute material requirements.")
+    else:
+        st.info("Upload your **BOM file** in the Data Ingestion tab to activate Procurement Alerts.")
+        
+    st.markdown("---")
 
     sales_df     = st.session_state.sales_df
     anchor_df    = st.session_state.anchor_df
@@ -388,52 +529,12 @@ with tab_dash:
         else:
             st.info("Awaiting combined stock and sales data.")
 
-    # -- DASH SECTION 4: SMART REQUIREMENT ENGINE --
-    st.markdown('<br><div class="flex-header"><h2>🧾 Smart Material Planning</h2></div>', unsafe_allow_html=True)
-    st.markdown("Automated raw material demand planning based on upcoming customer orders.")
-    
-    requirements_df = st.session_state.get('requirements_df')
-    bom_df          = st.session_state.get('bom_df')
 
-    if requirements_df is not None and not requirements_df.empty:
-        col_kpi1, col_kpi2 = st.columns(2)
-        buy_now_count = len(requirements_df[requirements_df['Status'] == 'BUY NOW'])
-        prepare_count = len(requirements_df[requirements_df['Status'] == 'PREPARE'])
-
-        with col_kpi1:
-            if buy_now_count > 0:
-                st.markdown(f'<div class="warning-box status-crit">🚨 <b>ACTION REQUIRED:</b> {buy_now_count} materials must be procured immediately to meet predicted orders.</div>', unsafe_allow_html=True)
-            elif prepare_count > 0:
-                st.markdown(f'<div class="warning-box status-warn">⚠️ <b>HEADS UP:</b> {prepare_count} materials are approaching low-stock against predicted orders.</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="warning-box status-ok">✅ <b>STOCK HEALTHY:</b> All materials sufficient for predicted upcoming orders.</div>', unsafe_allow_html=True)
-
-        def _req_style(val):
-            if val == 'BUY NOW':   return 'background-color: #fca5a5; color:#fff; font-weight:700'
-            if val == 'PREPARE':   return 'background-color: #fde68a; color:#b45309; font-weight:700'
-            if val == 'CHECK STOCK': return 'background-color: #bfdbfe; color:#1d4ed8; font-weight:700'
-            if val == 'OK':        return 'background-color: #bbf7d0; color:#15803d; font-weight:700'
-            return ''
-
-        try:
-            st.dataframe(
-                requirements_df.assign(**{"SR. NO.": range(1, len(requirements_df)+1)}).set_index("SR. NO.")
-                .style.applymap(_req_style, subset=['Status']),
-                use_container_width=True,
-                height=500
-            )
-        except Exception:
-            st.dataframe(requirements_df, use_container_width=True, height=500)
-
-    elif bom_df is not None and not bom_df.empty:
-        st.info("Upload Sales Bills to generate reorder predictions and compute material requirements.")
-    else:
-        st.info("Upload your **BOM file** in the Data Ingestion tab to activate Procurement Alerts.")
 
 # ─────────────────────────────────────────────────────────────
 # TAB 2: BOM RAW MAPPING
 # ─────────────────────────────────────────────────────────────
-with tab_bom:
+elif st.session_state.active_tab == "Material Requirements":
     st.markdown('<div class="flex-header"><h2>📋 Uploaded Bill of Materials</h2></div>', unsafe_allow_html=True)
     
     _bom = st.session_state.get('bom_df')
@@ -448,7 +549,7 @@ with tab_bom:
 # ─────────────────────────────────────────────────────────────
 # TAB 3: COMMODITY INSIGHTS
 # ─────────────────────────────────────────────────────────────
-with tab_commodity:
+elif st.session_state.active_tab == "Commodity Insights":
     st.markdown('<div class="flex-header"><h2>📈 Commodity Market Intelligence</h2></div>', unsafe_allow_html=True)
     st.markdown("Live 90-day futures tracking and 30-day algorithmic forecasts for raw materials. (Source: Yahoo Finance)")
     

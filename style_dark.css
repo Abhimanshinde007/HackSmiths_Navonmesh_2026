@@ -1,0 +1,190 @@
+/* =========================================================================
+   DARK / NIGHT OPULENCE THEME
+   ========================================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+html,
+body,
+[class*="css"] {
+    font-family: 'Outfit', sans-serif !important;
+}
+
+/* Base App Dark background */
+[data-testid="stAppViewContainer"] {
+    background-color: #0b1121 !important;
+    background-image:
+        radial-gradient(at 0% 0%, hsla(253, 16%, 7%, 1) 0, transparent 50%),
+        radial-gradient(at 50% 0%, hsla(225, 39%, 30%, 0.1) 0, transparent 50%),
+        radial-gradient(at 100% 0%, hsla(339, 49%, 30%, 0.1) 0, transparent 50%) !important;
+}
+
+[data-testid="stHeader"] {
+    background-color: transparent !important;
+}
+
+[class*="st-key-"] {
+    color: #e2e8f0 !important;
+}
+
+/* Header Typography */
+h1 {
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.5px;
+    background: linear-gradient(135deg, #ffffff 0%, #a5b4fc 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+h2 {
+    color: #cbd5e1 !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 16px !important;
+}
+
+/* Glassmorphism Metric Cards */
+[data-testid="stMetric"] {
+    background: rgba(30, 41, 59, 0.4) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 16px !important;
+    padding: 20px !important;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 2px 4px -1px rgba(0, 0, 0, 0.1) !important;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -2px rgba(0, 0, 0, 0.15) !important;
+    border-color: rgba(99, 102, 241, 0.3) !important;
+}
+
+[data-testid="stMetricLabel"] {
+    color: #94a3b8 !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+}
+
+[data-testid="stMetricValue"] {
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    font-size: 32px !important;
+}
+
+/* Custom Tabs styling */
+[data-baseweb="tab-list"] {
+    gap: 10px !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+    background-color: transparent !important;
+}
+
+[data-baseweb="tab"] {
+    font-size: 15px !important;
+    font-weight: 500 !important;
+    color: #64748b !important;
+    background-color: transparent !important;
+    border: none !important;
+    border-bottom: 3px solid transparent !important;
+    border-radius: 0 !important;
+    padding: 10px 20px !important;
+}
+
+[data-baseweb="tab"]:hover {
+    color: #cbd5e1 !important;
+}
+
+[data-baseweb="tab"][aria-selected="true"] {
+    color: #ffffff !important;
+    background-color: transparent !important;
+    border-bottom: 3px solid #6366f1 !important;
+    /* Indigo accent */
+}
+
+/* Dataframe styling overrides */
+[data-testid="stDataFrame"] {
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 12px !important;
+    overflow: hidden !important;
+}
+
+[data-testid="stDataFrame"] th {
+    background-color: rgba(15, 23, 42, 0.8) !important;
+    color: #94a3b8 !important;
+    font-weight: 600 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+
+[data-testid="stDataFrame"] td {
+    background-color: rgba(30, 41, 59, 0.4) !important;
+    color: #e2e8f0 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.02) !important;
+}
+
+/* File Uploader styling */
+[data-testid="stFileUploader"] {
+    background: rgba(30, 41, 59, 0.3) !important;
+    border: 1px dashed rgba(148, 163, 184, 0.4) !important;
+    border-radius: 12px !important;
+    padding: 1rem !important;
+    transition: all 0.2s ease;
+}
+
+[data-testid="stFileUploader"]:hover {
+    border-color: #6366f1 !important;
+    background: rgba(30, 41, 59, 0.5) !important;
+}
+
+[data-testid="stFileUploader"] section {
+    color: #e2e8f0 !important;
+}
+
+[data-testid="stFileUploader"] small {
+    color: #94a3b8 !important;
+}
+
+/* Primary Buttons */
+.stButton>button {
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    padding: 0.5rem 1rem !important;
+    opacity: 0.9;
+    transition: opacity 0.2s ease, transform 0.1s ease !important;
+}
+
+.stButton>button:hover {
+    opacity: 1;
+    transform: scale(1.02);
+}
+
+.stButton>button:active {
+    transform: scale(0.98);
+}
+
+/* Custom Warning Box (replacing the red CSS class) */
+.warning-box {
+    background-color: rgba(220, 38, 38, 0.1);
+    border: 1px solid rgba(220, 38, 38, 0.5);
+    color: #fca5a5;
+    padding: 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    margin-bottom: 16px;
+    backdrop-filter: blur(4px);
+}
+
+/* Flex Headers */
+.flex-header {
+    background: rgba(30, 41, 59, 0.5);
+    padding: 12px 16px;
+    border-radius: 8px;
+    border-left: 4px solid #6366f1;
+    margin-bottom: 1rem;
+    backdrop-filter: blur(8px);
+}
