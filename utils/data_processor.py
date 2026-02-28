@@ -1657,6 +1657,7 @@ def get_commodity_rates():
 # ─────────────────────────────────────────────────────────────
 import os
 import shutil
+import json
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.data')
 
@@ -1680,6 +1681,19 @@ def save_data(session_state):
                 saved_count += 1
             except Exception as e:
                 print(f"Error saving {key}: {e}")
+                
+    # Save scalar metrics to metadata
+    metadata = {}
+    if session_state.get('locked_capital') is not None:
+        metadata['locked_capital'] = float(session_state['locked_capital'])
+        
+    if metadata:
+        try:
+            with open(os.path.join(DATA_DIR, 'metadata.json'), 'w', encoding='utf-8') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"Error saving metadata.json: {e}")
+            
     return saved_count
 
 def load_data():
@@ -1696,6 +1710,17 @@ def load_data():
                 loaded[key] = pd.read_parquet(path)
             except Exception as e:
                 print(f"Error loading {key}: {e}")
+                
+    # Load scalar metrics
+    meta_path = os.path.join(DATA_DIR, 'metadata.json')
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+                loaded.update(metadata)
+        except Exception as e:
+            print(f"Error loading metadata.json: {e}")
+            
     return loaded
 
 def clear_data():

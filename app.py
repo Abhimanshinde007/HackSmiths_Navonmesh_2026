@@ -64,7 +64,7 @@ st.session_state.loaded_once = True
 
 for key in ['sales_df', 'purchase_df', 'stock_df',
             'anchor_df', 'predictions_df', 'stock_summary',
-            'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
+            'outlook_df', 'bom_df', 'requirements_df', 'process_logs', 'locked_capital']:
     if key not in st.session_state:
         st.session_state[key] = loaded.get(key, None)
 
@@ -148,8 +148,16 @@ with col_btn1:
             
 with col_btn2:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🔄 Refresh Data", help="Reload data from cache and refresh views", use_container_width=True):
-        st.session_state.loaded_once = False
+    if st.button("🔄 Reset Data", help="Clear all stored data and return to Onboarding", use_container_width=True):
+        with st.spinner("Purging database & resetting workspace..."):
+            import time
+            time.sleep(1.5)
+            clear_data()
+            for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs', 'locked_capital']:
+                st.session_state[key] = None
+            st.session_state.processed = False
+            st.session_state.loaded_once = False
+            st.session_state.company_name = None
         st.rerun()
 st.markdown("---")
 
@@ -157,7 +165,7 @@ st.markdown("---")
 # SIDEBAR NAVIGATION
 # ─────────────────────────────────────────────────────────────
 if 'active_tab' not in st.session_state:
-    st.session_state.active_tab = "Executive Dashboard" if st.session_state.processed else "Data Ingestion"
+    st.session_state.active_tab = "Data Ingestion"
 
 st.sidebar.markdown(f"**{st.session_state.company_name}**")
 st.sidebar.markdown("---")
@@ -211,12 +219,12 @@ if st.session_state.active_tab == "Data Ingestion":
         st.markdown("<br>", unsafe_allow_html=True)
         
         
-        if st.button("🔄 Reset All Data", help="Clear all stored data and refresh app", use_container_width=True):
+        if st.button("🔄 Reset Data", key="ingest_reset_btn", help="Clear all stored data and return to Onboarding", use_container_width=True):
             with st.spinner("Purging database & resetting workspace..."):
                 import time
                 time.sleep(1.5) # Simulate database purge for visual feedback
                 clear_data()
-                for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs']:
+                for key in ['sales_df', 'purchase_df', 'stock_df', 'anchor_df', 'predictions_df', 'stock_summary', 'outlook_df', 'bom_df', 'requirements_df', 'process_logs', 'locked_capital']:
                     st.session_state[key] = None
                 st.session_state.processed = False
                 st.session_state.loaded_once = False
@@ -392,7 +400,7 @@ elif st.session_state.active_tab == "Executive Dashboard":
     anchor_count     = len(anchor_df) if anchor_df is not None and not anchor_df.empty else 0
     total_materials  = stock_df['material'].nunique() if stock_df is not None and not stock_df.empty else 0
     pred_count       = len(predictions) if predictions is not None and not predictions.empty else 0
-    locked_cap_val   = st.session_state.get('locked_capital', 0.0)
+    locked_cap_val   = st.session_state.get('locked_capital', 0.0) or 0.0
 
     # Replace raw HTML with native UI columns for proper margins
     k1, k2, k3, k4, k5 = st.columns(5)
