@@ -565,8 +565,12 @@ elif st.session_state.active_tab == "Commodity Insights":
         comm_data, comm_err = get_commodity_rates()
     
     if comm_err:
-        st.error(comm_err)
-    elif comm_data:
+        if str(comm_err).startswith("warning:"):
+            st.warning("⚠️ **Network Restriction:** Cannot display live market prices from Yahoo Finance. Falling back to offline simulated baseline models.")
+        else:
+            st.error(comm_err)
+            
+    if comm_data:
         c1, c2 = st.columns(2)
         cols = [c1, c2]
         for idx, (commodity, data) in enumerate(comm_data.items()):
