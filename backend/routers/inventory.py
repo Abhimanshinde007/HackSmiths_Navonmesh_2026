@@ -6,6 +6,18 @@ import io
 
 from .. import database, models, schemas
 from .auth import get_current_user
+import math
+
+def clean_dict_nan(d):
+    clean = {}
+    for k, v in d.items():
+        if isinstance(v, float) and math.isnan(v):
+            clean[k] = None
+        elif pd.isna(v):
+            clean[k] = None
+        else:
+            clean[k] = v
+    return clean
 
 # Import the existing rock-solid business logic
 import sys
@@ -50,7 +62,7 @@ async def upload_sales(
         
     # Convert dataframe to records for JSON response
     # We replace NaNs with None for valid JSON serialization
-    records = df.where(pd.notnull(df), None).to_dict(orient="records")
+    records = [clean_dict_nan(rd) for rd in df.to_dict(orient="records")]
     return {"message": "Sales data ingested successfully", "errors": errors, "row_count": len(df), "data": records}
 
 @router.post("/upload/purchase")
@@ -69,7 +81,7 @@ async def upload_purchase(
     if errors and df.empty:
         raise HTTPException(status_code=400, detail="|".join(errors))
         
-    records = df.where(pd.notnull(df), None).to_dict(orient="records")
+    records = [clean_dict_nan(rd) for rd in df.to_dict(orient="records")]
     return {"message": "Purchase data ingested successfully", "errors": errors, "row_count": len(df), "data": records}
 
 @router.post("/upload/stock")
@@ -107,8 +119,8 @@ async def upload_stock_registers(
     # Store stock updates into the PostgreSQL Products table
     # This marries the Hackathon pandas logic with the new MSME Database
     for _, row in stock_df.iterrows():
-        sku = str(row['material']).strip()
-        qty = float(row['current_stock'])
+        sku = str(row.get('Material', '')).strip()
+        qty = float(row.get('Current Stock', 0.0))
         
         db_product = db.query(models.Product).filter(models.Product.sku == sku).first()
         if db_product:
@@ -118,7 +130,7 @@ async def upload_stock_registers(
             db.add(new_prod)
     db.commit()
 
-    records = stock_df.where(pd.notnull(stock_df), None).to_dict(orient="records")
+    records = [clean_dict_nan(rd) for rd in stock_df.to_dict(orient="records")]
     return {"message": "Stock processed and DB updated", "errors": in_errs + out_errs + [s_err] if s_err else [], "data": records}
 
 @router.get("/stock", response_model=List[schemas.Product])

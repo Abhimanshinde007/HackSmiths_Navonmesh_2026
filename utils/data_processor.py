@@ -423,7 +423,7 @@ def parse_tally_visual_excel(file_bytes, fname='file'):
     raw = None
 
     # Try openpyxl first (for .xlsx), then xlrd (for .xls), then HTML
-    for engine in [None, 'xlrd']:
+    for engine in ['openpyxl', 'xlrd', None]:
         try:
             kwargs = {'header': None, 'dtype': str}
             if engine:
@@ -669,7 +669,21 @@ def ingest_sales_excel(files):
             continue
 
         # Structured tabular Excel - use strict column mapping
-        df_raw, err = _read_excel_smart(_io.BytesIO(file_bytes), SALES_CONTEXT_KW, min_kw=2)
+        
+        # Helper inner function patch for _read_excel_smart
+        try:
+            df_raw = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, engine='openpyxl').fillna('')
+            hdr_row = _detect_header_row(df_raw, min_kw=2, keywords=SALES_CONTEXT_KW)
+            if hdr_row is None:
+                errors.append(f"{fname}: Unable to detect structured table header.")
+                continue
+            df_raw = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str, engine='openpyxl')
+            df_raw.columns = [str(c).strip() for c in df_raw.columns]
+            df_raw = df_raw.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
+            err = None
+        except Exception as e:
+            err = f"File read error: {str(e)}"
+            df_raw = None
         if err:
             errors.append(f"{fname}: {err}")
             continue
@@ -759,7 +773,19 @@ def ingest_purchase_excel(files):
                 frames.append(df_out)
             continue
 
-        df_raw, err = _read_excel_smart(_io.BytesIO(file_bytes), PURCHASE_CONTEXT_KW, min_kw=2)
+        try:
+            df_raw = pd.read_excel(_io.BytesIO(file_bytes), header=None, dtype=str, engine='openpyxl').fillna('')
+            hdr_row = _detect_header_row(df_raw, min_kw=2, keywords=PURCHASE_CONTEXT_KW)
+            if hdr_row is None:
+                errors.append(f"{fname}: Unable to detect structured table header.")
+                continue
+            df_raw = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str, engine='openpyxl')
+            df_raw.columns = [str(c).strip() for c in df_raw.columns]
+            df_raw = df_raw.replace('', pd.NA).dropna(how='all').reset_index(drop=True)
+            err = None
+        except Exception as e:
+            err = f"File read error: {str(e)}"
+            df_raw = None
         if err:
             errors.append(f"{fname}: {err}")
             continue
@@ -909,8 +935,16 @@ def predict_reorder(sales_df, anchor_df):
             early = predicted - pd.Timedelta(days=round(half_sig))
             late  = predicted + pd.Timedelta(days=round(half_sig))
 
+            pred_product = 'UNKNOWN'
+            if 'product' in orders.columns:
+                try:
+                    pred_product = orders['product'].mode()[0]
+                except Exception:
+                    pred_product = orders['product'].iloc[-1] if not orders.empty else 'UNKNOWN'
+
             results.append({
                 'Customer':             cust,
+                'Predicted Product':    pred_product,
                 'Last Order':           last_order.strftime('%d %b %Y'),
                 'Avg Interval (Days)':  round(mu, 1),
                 'Predicted Next Order': predicted.strftime('%d %b %Y'),
@@ -982,7 +1016,7 @@ def _read_register_excel(file_bytes, fname):
             break
 
     import io as _io2
-    df = pd.read_excel(_io2.BytesIO(file_bytes), header=hdr_row, dtype=str).fillna('')
+    df = pd.read_excel(_io2.BytesIO(file_bytes), header=hdr_row, dtype=str, engine='openpyxl').fillna('')
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how='all').reset_index(drop=True)
     return df, None
@@ -1303,7 +1337,7 @@ def ingest_bom_excel(file):
         return pd.DataFrame(), f"{fname}: Cannot read -- {e}"
 
     raw = None
-    for engine in [None, 'xlrd']:
+    for engine in ['openpyxl', 'xlrd', None]:
         try:
             kw = {'header': None, 'dtype': str}
             if engine:
@@ -1324,7 +1358,7 @@ def ingest_bom_excel(file):
             hdr_row = i
             break
 
-    df = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str).fillna('')
+    df = pd.read_excel(_io.BytesIO(file_bytes), header=hdr_row, dtype=str, engine='openpyxl').fillna('')
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     # Map columns flexibly finding combinations of keywords across newlines
@@ -1413,17 +1447,16 @@ def compute_material_requirements(predictions_df, bom_df, stock_summary_df):
 
         for _, pred in predictions_df.iterrows():
             customer = pred.get('Customer', 'Unknown')
-            product  = str(pred.get('Last Order', ''))  # use product from sales later
+            product  = str(pred.get('Predicted Product', ''))
 
-            # Try to match BOM row by product name prefix
             bom_match = None
-            pred_product = customer  # fallback label
+            pred_product = product if product and product != 'UNKNOWN' else customer
 
-            # Match BOM rows to this prediction's likely product
-            # (Sales data needed for exact match â€” use first 8 chars of product)
             for _, brow in bom_df.iterrows():
-                bom_match = brow
-                break  # For now use first match; will be refined with sales linkage
+                bom_prod = str(brow.get('product', '')).lower()
+                if bom_prod and (bom_prod in pred_product.lower() or pred_product.lower() in bom_prod):
+                    bom_match = brow
+                    break
 
             if bom_match is None:
                 continue

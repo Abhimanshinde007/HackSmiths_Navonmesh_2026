@@ -32,6 +32,8 @@ def clean_dict_nan(d):
     for k, v in d.items():
         if isinstance(v, float) and math.isnan(v):
             clean[k] = None
+        elif pd.isna(v):
+            clean[k] = None
         else:
             clean[k] = v
     return clean
@@ -56,15 +58,32 @@ async def upload_bom_excel(
         
     records = [clean_dict_nan(rd) for rd in df.to_dict(orient="records")]
     
-    # Could optionally insert straight into models.BillOfMaterial here
-    # Requires matching 'product' to Product ID and 'material' to Component Product ID
+    # Insert straight into models.BOMRecord
+    for _, row in df.iterrows():
+        prod = str(row.get('product', '')).strip()
+        if not prod: continue
+        
+        db_bom = db.query(models.BOMRecord).filter(models.BOMRecord.product == prod).first()
+        if not db_bom:
+            db_bom = models.BOMRecord(product=prod)
+            db.add(db_bom)
+            
+        db_bom.copper_type = str(row.get('copper_type', ''))
+        db_bom.copper_weight_kg = float(row.get('copper_weight_kg', 0) or 0)
+        db_bom.lamination_type = str(row.get('lamination_type', ''))
+        db_bom.lamination_weight_kg = float(row.get('lamination_weight_kg', 0) or 0)
+        db_bom.bobbin_type = str(row.get('bobbin_type', ''))
+        db_bom.other_reqs = str(row.get('other_reqs', ''))
+        
+    db.commit()
     
-    return {"message": "BOM extracted", "errors": errs, "data": records}
+    return {"message": "BOM extracted and saved to Database", "errors": errs, "data": records}
 
 @router.post("/explode")
 async def run_bom_explosion(
     request: BomExplodeRequest,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     """
     Integrate the BOM Explosion logic to calculate raw material requirements.
@@ -76,7 +95,11 @@ async def run_bom_explosion(
     bom_df = pd.DataFrame(request.bom_data)
     forecast_df = pd.DataFrame(request.forecast_data)
     
-    req_df, err = compute_material_requirements(forecast_df, bom_df)
+    # Needs stock df from db
+    products = db.query(models.Product).all()
+    stock_df = pd.DataFrame([{"Material": p.sku, "Current Stock": p.current_stock} for p in products])
+    
+    req_df, err = compute_material_requirements(forecast_df, bom_df, stock_df)
     if err:
         raise HTTPException(status_code=400, detail=err)
         

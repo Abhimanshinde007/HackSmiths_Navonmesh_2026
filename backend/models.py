@@ -39,13 +39,17 @@ class Product(Base):
     # used_in = relationship("BillOfMaterial", foreign_keys="[BillOfMaterial.component_product_id]")
 
 
-class BillOfMaterial(Base):
-    __tablename__ = "bill_of_materials"
+class BOMRecord(Base):
+    __tablename__ = "bom_records"
 
     id = Column(Integer, primary_key=True, index=True)
-    parent_product_id = Column(Integer, ForeignKey("products.id"))
-    component_product_id = Column(Integer, ForeignKey("products.id"))
-    quantity_required = Column(Float)
+    product = Column(String, unique=True, index=True)
+    copper_type = Column(String)
+    copper_weight_kg = Column(Float)
+    lamination_type = Column(String)
+    lamination_weight_kg = Column(Float)
+    bobbin_type = Column(String)
+    other_reqs = Column(String)
 
 
 class HistoricalAnalysis(Base):
